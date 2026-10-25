@@ -1,9 +1,14 @@
 # Verification transcript
-# Date: 2026-10-25T20:56:08Z
+# Date: 2026-10-25T21:08:02Z
 # Sandbox has no Android SDK, no gradle distribution and no Maven Central access, so Gradle
 # cannot run here. Instead the touched pure-Kotlin sources and the real committed JUnit test
 # sources were compiled with kotlinc (2.4.21) and executed against a minimal local stand-in for
 # the JUnit 4 API (org.junit.Test / org.junit.Assert). The test bodies are unmodified.
+# Sources are taken from a clean clone with both patches applied (git am), not from a work tree.
+
+$ git am 0001-*.patch 0002-*.patch   (on a fresh clone of yuga-hashimoto/and-code at 414c780)
+Applying: feat(policy): add an in-app risk engine and task state machine
+Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 
 $ java -version
 openjdk version "25.0.2" 2026-01-20 LTS
@@ -56,6 +61,18 @@ $ java -cp out RunnerKt /tmp/out
   PASS wiping the root filesystem is refused
   PASS writing a credential file is refused outright
   PASS writing git config is protected
+== com.yugahashimoto.andcode.core.policy.ToolCallMapperTest (11 tests)
+  PASS a camel case tool name is tokenised too
+  PASS a file count hint is carried through
+  PASS a network tool reports its host
+  PASS a shell tool keeps its command
+  PASS an mcp-prefixed write tool maps to a file write
+  PASS an unknown tool stays unknown
+  PASS deletes, pushes, releases and installs keep their kind
+  PASS mapping and assessment together allow an ordinary workspace edit
+  PASS mapping and assessment together refuse a credential write
+  PASS mapping and assessment together refuse a destructive shell call
+  PASS newline separated paths are split
 == com.yugahashimoto.andcode.core.security.SecretRedactionTest (15 tests)
   PASS leaves ordinary text untouched
   PASS redact also strips query strings from urls embedded in arbitrary text
@@ -72,6 +89,20 @@ $ java -cp out RunnerKt /tmp/out
   PASS redacts the credential behind a Basic authorization header
   PASS strips oauth query parameters from urls before logging
   PASS url without a query string is returned unchanged
+== com.yugahashimoto.andcode.core.task.TaskResumeTest (13 tests)
+  PASS a blocked plan leaves the progress untouched
+  PASS a finished task cannot be resumed
+  PASS a task with nothing left to run is not reported as resumable
+  PASS an interrupted side effect is never re-run automatically
+  PASS begin spends one attempt and resets only the repeatable steps
+  PASS cancelling a terminal task is refused
+  PASS cancelling reports the steps the caller has to stop
+  PASS confirming a side effect queues it and abandoning it skips it
+  PASS confirming a step that is not in flight changes nothing
+  PASS pausing does not refill the wall clock budget
+  PASS recording steps respects the trail limit by keeping the newest
+  PASS resuming reports what is done, what runs and what needs confirmation
+  PASS spent attempts block a resume
 == com.yugahashimoto.andcode.core.task.TaskStateMachineTest (11 tests)
   PASS a cancelled task cannot report success
   PASS a failure can be retried from inspection or straight back into execution
@@ -86,8 +117,8 @@ $ java -cp out RunnerKt /tmp/out
   PASS the full happy path is allowed
 == org.junit.Test (0 tests)
 
-RESULT passed=65 failed=0
+RESULT passed=89 failed=0
 run exit=0
 
 # Style checks the sandbox could not run through Gradle: line length / trailing whitespace / final newline
-files checked=15 issues=0
+files checked=21 issues=0

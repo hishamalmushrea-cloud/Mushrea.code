@@ -4,9 +4,10 @@
 
 ## 1. الملخص
 
-نُفِّذت **الحزمة الأولى المتماسكة منخفضة المخاطر**: أساس دورة المهمة ومحرك المخاطر داخل التطبيق،
-كـ Kotlin نقية بلا أي اعتماد على Android، مع 51 حالة اختبار جديدة (50 في الحزم الجديدة + 1 في
-`SecretRedactionTest`) جُمِّعت ونُفِّذت فعليًا: 65 اختبارًا ناجحًا شملت 14 اختبارًا قائمًا. لم يُمسّ أي ملف Android، ولم يتغيّر سلوك
+نُفِّذت **حزمتان متماسكتان منخفضتا المخاطر**: أساس دورة المهمة ومحرك المخاطر داخل التطبيق، ثم قواعد
+الاستئناف/التأكيد/الإلغاء ومحوّل استدعاء الأداة. كل ذلك Kotlin نقية بلا أي اعتماد على Android، مع
+76 حالة اختبار جديدة (75 في الحزم الجديدة + 1 في `SecretRedactionTest`) جُمِّعت ونُفِّذت فعليًا:
+**89 اختبارًا ناجحًا** شملت 14 اختبارًا قائمًا. لم يُمسّ أي ملف Android، ولم يتغيّر سلوك
 التطبيق الحالي، ولم يُبنَ أي APK.
 
 الوظيفة الجديدة **غير موصولة بالواجهة بعد** بشكل مقصود: الأساس يُراجع أولًا، والربط هو التغيير التالي
@@ -28,8 +29,16 @@
 
 ## 3. التغييرات
 
-الفرع المحلي المستخدم: `feat/policy-risk-engine` والـ commit: `a179b6c` (18 ملفًا، +1,688 سطرًا، صفر حذف).
-التسليم في هذا المستودع كملف patch: `patches/0001-feat-policy-risk-engine-and-task-state-machine.patch`.
+الفرع المحلي المستخدم: `feat/policy-risk-engine`، commit‑ان فوق `414c780`:
+
+| # | commit | المحتوى | الحجم |
+| --- | --- | --- | --- |
+| 1 | `a179b6c` | محرك المخاطر + آلة حالات المهمة | 18 ملفًا، +1,688 |
+| 2 | `1a8a67a` | الاستئناف/التأكيد/الإلغاء + محوّل استدعاء الأداة | 7 ملفات، +643 / −10 |
+
+التسليم في هذا المستودع كملفَّي patch يُطبَّقان بالترتيب:
+`patches/0001-feat-policy-risk-engine-and-task-state-machine.patch` ثم
+`patches/0002-feat-task-resume-and-tool-call-mapper.patch`.
 
 | ملف | النوع | السبب |
 | --- | --- | --- |
@@ -43,8 +52,12 @@
 | `core/policy/PolicyAuditLog.kt` | جديد | سجل قرارات محدود (200) يخزّن الأكواد والملخص المنقّى فقط |
 | `core/task/TaskState.kt` | جديد | حالات المهمة + `TaskFacts` |
 | `core/task/TaskStateMachine.kt` | جديد | جدول الانتقالات + حرّاس النجاح والموافقة |
+| `core/task/TaskLimits.kt` | جديد | حدود المحاولات والوقت وحجم السجل لكل مهمة |
+| `core/task/TaskProgress.kt` | جديد | سجل خطوات المهمة + ما يلزم للاستئناف (خطوات، محاولات، بداية) |
+| `core/task/TaskResume.kt` | جديد | قواعد الاستئناف والتأكيد والإلغاء الفعلي |
+| `core/policy/ToolCallMapper.kt` | جديد | `ToolCall(name, args)` → `PolicyOperation` بلا معرفة بأي CLI |
 | `core/security/SecretRedaction.kt` | تعديل (+5) | نمط لصيغة `--password value`، لأن المحرك أصبح يعرض سطور أوامر |
-| 4 ملفات اختبار جديدة + توسيع `SecretRedactionTest` | جديد | 51 حالة تغطي الحالات الحساسة |
+| 6 ملفات اختبار جديدة + توسيع `SecretRedactionTest` | جديد | 76 حالة تغطي الحالات الحساسة |
 | `docs/POLICY_ENGINE.md` | جديد | تصميم، حدود، وخطة الربط |
 | `README.md` | تعديل (سطر) | ربط التوثيق الجديد في قسم Documentation |
 
@@ -72,6 +85,13 @@ RiskAssessment(level, decision, reasons)  ──►  PolicyAuditLog (محدود�
 TaskStateMachine: DRAFT → INSPECTING → PLANNED → AWAITING_APPROVAL → READY → RUNNING
                   → VERIFYING → CHECKS_PASSED → READY_FOR_REVIEW → READY_TO_SHIP → SHIPPED
                   (+ FAILED / PAUSED / CANCELLED)، بحرّاس على checksGreen و approved.
+
+بعد إعادة تشغيل التطبيق:
+TaskProgress المحفوظ ──► TaskResume.plan(now, limits)
+        ├─ خطوة ذات أثر جانبي كانت RUNNING → تنتظر تأكيدًا صريحًا (لا تُعاد تلقائيًا)
+        ├─ خطوة بلا أثر جانبي كانت RUNNING → تُعاد بأمان
+        ├─ attempts / maxWallClockMs مستنفدة → Blocked (والساعة لا تُصفَّر بالاستئناف)
+        └─ TaskResume.cancel() → يعيد معرّفات الخطوات التي يجب إيقافها فعلًا
 ```
 
 **حدود مهمة:** `CommandInspector` مطابِق أنماط لا محلّل shell؛ الأوامر المُشوَّشة أو السكربتات على القرص
@@ -87,14 +107,20 @@ TaskStateMachine: DRAFT → INSPECTING → PLANNED → AWAITING_APPROVAL → REA
 CommandInspectorTest   12/12
 PolicyAuditLogTest      4/4
 RiskEngineTest         23/23
+ToolCallMapperTest     11/11
 SecretRedactionTest    15/15   (14 قائمة + 1 جديد)
+TaskResumeTest         13/13
 TaskStateMachineTest   11/11
-RESULT passed=65 failed=0
+RESULT passed=89 failed=0
 ```
 
-**فشلان ظهرا في التشغيل الأول وأُصلحا** (لم يُخفَ أي منهما):
+والمصادر في التشغيل الأخير مأخوذة من نسخة استنساخ نظيفة طُبِّق عليها الـ patch‑ان بـ `git am`، أي أن
+المُختبَر هو نفس ما سيصل إلى المستودع.
+
+**ثلاثة إخفاقات ظهرت في التشغيل وأُصلحت** (لم يُخفَ أي منها):
 1. `./gradlew … assembleRelease` لم يُصنَّف كإصدار لأن النمط كان camelCase والسطر يُحوَّل لأحرف صغيرة.
 2. صيغة `--password value` كانت تتسرّب من `SecretRedaction`؛ أُضيف نمط لها مع اختبار.
+3. `writeFile` صُنِّف `UNKNOWN` لأن فصل camelCase كان يستبدل المطابقة كلها بمسافة (`write ile`).
 
 **لم يُشغَّل:** `detekt`, `spotlessCheck`, `lintGithubDebug`, `testGithubDebugUnitTest` بكاملها (1,478
 اختبارًا)، `assembleGithubDebug/Release`, أي `androidTest`، وأي اختبار على جهاز.
@@ -113,6 +139,8 @@ RESULT passed=65 failed=0
 - تقنين المسارات قبل الحكم، فلا يمر `../../etc/hosts` ككتابة داخلية.
 - تنقية كل تفصيل سبب وكل ملخص عملية عبر `SecretRedaction` قبل التخزين أو العرض؛ السجل يخزّن أكوادًا لا نصوصًا.
 - سجل محدود الحجم (200) لمنع تضخّم الذاكرة في جلسة طويلة.
+- عند الاستئناف، لا تُعاد خطوة ذات أثر جانبي (كتابة/دفع/نشر) تلقائيًا لأنها قد تكون وقعت قبل الإغلاق؛
+  تنتظر تأكيدًا. وميزانية الوقت لا تُصفَّر بالاستئناف، فلا مأزق يمتد بلا حد.
 
 **ما لم يُتحقق منه:** لا شيء من هذا **مفعَّل** بعد لأن المحرك غير موصول؛ ولا يمكن اعتباره حدًا أمنيًا
 بمعزل عن الـ PRoot الذي هو أيضًا ليس عزلًا كاملًا. لم يُجرَ أي اختبار اختراق أو تحليل أمني خارجي.
@@ -134,14 +162,15 @@ RESULT passed=65 failed=0
 
 ## 10. المتبقي (بحسب الأولوية)
 
-1. **P2.1 — ربط المحرك بمسار الموافقة** (APK جديد): محوّل `PermissionRequest`/طلبات
-   `ClaudePermissionBridge` → `PolicyOperation`، ثم `ALLOW`/`REQUIRE_APPROVAL`/`DENY` على المسار القائم،
-   مع مفاتيح `PolicyConfig` في الإعدادات. الملف الحرج: `feature/chat/ChatViewModel.kt` (134 KB) — تدخّل
-   جراحي ومراجعة diff كاملة.
-2. **سجل تدقيق مثبَّت** (append-only) إن لزم البقاء بعد إغلاق التطبيق؛ الحالي في الذاكرة فقط.
-3. **P3 — نظام القدرات والذاكرة الهندسية**: عقد قدرة بمخطط وإصدارات ودورة حياة، وذاكرة مرتبطة بـ commit.
-4. **P1.b — استئناف/إلغاء للمهمة**: تخزين `TaskState` وحفظ الخطوات المكتملة ومنع تكرار الكتابة عند الاستئناف،
-   وإلغاء فعلي للعمليات القابلة للإيقاف.
+1. **P2.1 — ربط المحرك بمسار الموافقة** (APK جديد): النصف المستقل عن الـ CLI جاهز
+   (`ToolCallMapper`)؛ الباقي محوّل واحد لكل backend ينتج `ToolCall` من `PermissionRequest` ومن طلبات
+   `ClaudePermissionBridge`، ثم `ALLOW`/`REQUIRE_APPROVAL`/`DENY` على المسار القائم، مع مفاتيح
+   `PolicyConfig` في الإعدادات. الملف الحرج: `feature/chat/ChatViewModel.kt` (134 KB) — تدخّل جراحي
+   ومراجعة diff كاملة.
+2. **تثبيت حالة المهمة**: حفظ `TaskProgress` في تخزين التطبيق وربط زر الإلغاء بـ`TaskResume.cancel()`
+   (القواعد جاهزة ومختبرة، والنقل إلى التخزين هو ما تبقّى).
+3. **سجل تدقيق مثبَّت** (append-only) إن لزم البقاء بعد إغلاق التطبيق؛ الحالي في الذاكرة فقط.
+4. **P3 — نظام القدرات والذاكرة الهندسية**: عقد قدرة بمخطط وإصدارات ودورة حياة، وذاكرة مرتبطة بـ commit.
 5. **P4 — اكتشاف المشروع وتشغيل الفحوص المحدودة** وتصنيف الفشل (بيئة/شيفرة/اختبار).
 6. **إكمال العرض في الواجهة**: مركز المهام، خطة التغيير، القدرات، نتائج المهمة، الأمان والموافقات.
 7. **P5**: وكيل متصفح، أدوات USB/ADB للقراءة فقط (المحرك يرفض عمليات الجهاز التدميرية أصلًا)،
@@ -170,10 +199,11 @@ git am /path/to/patches/0001-feat-policy-risk-engine-and-task-state-machine.patc
 ## 12. حالة Git
 
 - العمل جرى على نسخة استنساخ حقيقية للمستودع المستهدف في مسار مؤقت خارج هذا المستودع:
-  الفرع `feat/policy-risk-engine`، commit واحد `a179b6c` فوق `414c780`، شجرة عمل نظيفة بعده.
+  الفرع `feat/policy-risk-engine`، commit‑ان `a179b6c` و`1a8a67a` فوق `414c780`، شجرة عمل نظيفة بعدهما.
 - **لم يُدفع** أي شيء إلى `yuga-hashimoto/and-code`: حساب GitHub المتصل لا يملك صلاحية `push`
   (`permissions.push = false` بحسب API). لذلك سُلِّم العمل كـ patch.
 - في هذا المستودع (`Mushrea.code`، الفرع `arena/ea667b72-mushrea-code`) أُضيفت:
-  `patches/0001-…patch`، `patches/verification-log.txt`، `docs/andcode/BASELINE_AR.md`،
-  `PLAN_AR.md`، `VERIFICATION_AR.md`، `FINAL_REPORT_AR.md` (هذا الملف)، و`README_AR.md`.
+  `patches/0001-…patch`، `patches/0002-…patch`، `patches/verification-log.txt`،
+  `docs/andcode/BASELINE_AR.md`، `PLAN_AR.md`، `VERIFICATION_AR.md`، `FINAL_REPORT_AR.md` (هذا الملف)،
+  و`README_AR.md`. وقد تم **دفع الفرع إلى `origin`** (`hishamalmushrea-cloud/Mushrea.code`).
 - لم يُنشأ إصدار، ولم يُنشر أي artifact، ولم يُحذف أو يُعاد تسمية أي شيء في المستودع الأصلي.

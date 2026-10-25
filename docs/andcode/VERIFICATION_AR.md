@@ -27,14 +27,19 @@ Maven.
 ### النتيجة
 
 ```
-== com.yugahashimoto.andcode.core.policy.CommandInspectorTest (12 tests)   -> 12 PASS
-== com.yugahashimoto.andcode.core.policy.PolicyAuditLogTest (4 tests)      -> 4 PASS
-== com.yugahashimoto.andcode.core.policy.RiskEngineTest (23 tests)         -> 23 PASS
-== com.yugahashimoto.andcode.core.security.SecretRedactionTest (15 tests)  -> 15 PASS   (14 قائمة + 1 جديد)
-== com.yugahashimoto.andcode.core.task.TaskStateMachineTest (11 tests)     -> 11 PASS
+== core.policy.CommandInspectorTest     (12 tests)  -> 12 PASS
+== core.policy.PolicyAuditLogTest        (4 tests)  ->  4 PASS
+== core.policy.RiskEngineTest           (23 tests)  -> 23 PASS
+== core.policy.ToolCallMapperTest       (11 tests)  -> 11 PASS
+== core.security.SecretRedactionTest    (15 tests)  -> 15 PASS   (14 قائمة + 1 جديد)
+== core.task.TaskResumeTest             (13 tests)  -> 13 PASS
+== core.task.TaskStateMachineTest       (11 tests)  -> 11 PASS
 
-RESULT passed=65 failed=0
+RESULT passed=89 failed=0
 ```
+
+المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّق عليها الـ patch‑ان بـ `git am`** (لا من شجرة
+عمل معدّلة يدويًا)، أي أن ما تم تشغيله هو بالضبط ما سيصل إلى المستودع.
 
 الشيفرة تُترجم بلا أخطاء ولا تحذيرات، والاختبارات الـ 14 القائمة لـ`SecretRedaction` تمر بعد إضافة النمط
 الجديد — أي لا انحدار في الملف المعدَّل الوحيد من الشيفرة القائمة.
@@ -45,6 +50,7 @@ RESULT passed=65 failed=0
 | --- | --- | --- |
 | `./gradlew :app:assembleRelease` لم يُصنَّف كإصدار | كان سطر الأمر يُحوَّل إلى أحرف صغيرة قبل المطابقة، والنمط مكتوب `assembleRelease` | النمط صار بأحرف صغيرة مع تعليق يوضّح العقد |
 | تفاصيل سبب قد تحمل سرًا بصيغة `--password value` | `SecretRedaction` يغطي `key=value` و`Bearer` فقط | أُضيف نمط لصيغة أعلام سطر الأوامر + اختبار له |
+| `writeFile` صُنِّف `UNKNOWN` بدل `WRITE_FILE` | فصل camelCase كان يستبدل المطابقة كلها بمسافة فتصبح `write ile` | الاستبدال صار `"$1 $2"` مع تعليق يشرح الخطأ |
 
 ### فحوص تنسيق أُجريت يدويًا (لأن spotless غير متاح)
 
@@ -52,19 +58,21 @@ RESULT passed=65 failed=0
 سطر جديد في نهاية الملف → `files checked=15 issues=0`. الملفات تتبع أسلوب المستودع (تعليقات KDoc
 تشرح السبب، أسماء اختبارات بين backticks، فواصل لاحقة trailing commas كما في بقية المشروع).
 
-## فحص تطبيق الـ patch على نسخة نظيفة
+## فحص تطبيق الـ patches على نسخة نظيفة
 
 ```
-$ git clone --depth 1 https://github.com/yuga-hashimoto/and-code.git /tmp/applycheck
-$ git am patches/0001-feat-policy-risk-engine-and-task-state-machine.patch
+$ git clone --depth 1 https://github.com/yuga-hashimoto/and-code.git /tmp/applycheck2
+$ git am patches/0001-*.patch patches/0002-*.patch
 Applying: feat(policy): add an in-app risk engine and task state machine
-$ git log --oneline -2
-d6ffb50 feat(policy): add an in-app risk engine and task state machine
+Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+$ git log --oneline -3
+a4a8bbc feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+df457e3 feat(policy): add an in-app risk engine and task state machine
 414c780 Merge pull request #404 from yuga-hashimoto/feat/402-edit-local-workspace-files
 ```
 
-أي أن الـ patch يُطبَّق بلا تعارض على `main` الحالي (`414c780`)، والملفات الثمانية الجديدة موجودة بعد
-التطبيق.
+أي أن الـ patch‑ين يُطبَّقان بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، و13 ملف إنتاج جديدًا
+موجودة بعد التطبيق.
 
 ## ما لم يُشغَّل (وهذا مذكور كقيد، لا كنجاح)
 

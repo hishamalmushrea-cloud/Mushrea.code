@@ -1,0 +1,775 @@
+From 1a8a67a88ddc2c54a59d63692429ca4b12240564 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sun, 25 Oct 2026 21:07:53 +0000
+Subject: [PATCH] feat(task): add resume, confirmation and cancellation rules,
+ plus the tool-call mapper
+
+Second slice of the evolution work: what a saved task means after a restart and
+the CLI-independent half of the policy wiring.
+
+core/task:
+- TaskProgress/TaskStep record the trail, and TaskLimits holds the hard stops
+  (attempts, wall clock, steps) as per-task settings rather than model-writable
+  fields.
+- TaskResume never re-runs an interrupted side-effecting step automatically: it
+  was RUNNING when the process died, so it may already have landed, and it comes
+  back as "awaiting confirmation" until the user confirms or abandons it.
+  Repeatable steps are simply reset and run again.
+- The wall clock is counted from startedAtMs and pausing does not refill it, so
+  a stuck task cannot get a fresh budget by being resumed.
+- cancel() returns the ids of the in-flight steps and marks them skipped, so a
+  caller that only hides the UI is visibly wrong instead of silently wrong.
+
+core/policy:
+- ToolCallMapper turns ToolCall(name, flat args) into a PolicyOperation, so the
+  only CLI-specific code left for the wiring is one adapter per backend.
+  writeFile / write_file / mcp__andcode__write_file all map to WRITE_FILE; an
+  unrecognised tool maps to UNKNOWN, which the engine asks the user about.
+
+Tests: TaskResumeTest (13), ToolCallMapperTest (11). 89 cases now run green
+locally, including the 14 pre-existing SecretRedaction tests.
+
+docs/POLICY_ENGINE.md documents the resume rules and lists the remaining wiring
+steps in order.
+---
+ .../andcode/core/policy/ToolCallMapper.kt     | 102 ++++++++++
+ .../andcode/core/task/TaskLimits.kt           |  29 +++
+ .../andcode/core/task/TaskProgress.kt         |  67 +++++++
+ .../andcode/core/task/TaskResume.kt           | 184 ++++++++++++++++++
+ .../andcode/core/policy/ToolCallMapperTest.kt |  88 +++++++++
+ .../andcode/core/task/TaskResumeTest.kt       | 134 +++++++++++++
+ docs/POLICY_ENGINE.md                         |  49 ++++-
+ 7 files changed, 643 insertions(+), 10 deletions(-)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/policy/ToolCallMapper.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/task/TaskLimits.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/task/TaskResume.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/policy/ToolCallMapperTest.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/task/TaskResumeTest.kt
+
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/policy/ToolCallMapper.kt b/app/src/main/java/com/yugahashimoto/andcode/core/policy/ToolCallMapper.kt
+new file mode 100644
+index 0000000..b7a4d04
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/policy/ToolCallMapper.kt
+@@ -0,0 +1,102 @@
++package com.yugahashimoto.andcode.core.policy
++
++/**
++ * A tool call reduced to what the policy engine needs: a name and flat string arguments.
++ *
++ * Deliberately not the runtime's own model. Each backend (OpenCode's `PermissionRequest`, the Claude
++ * Code permission hook, Antigravity, Codex) shapes its payload differently, so the CLI-specific part
++ * of the wiring is one adapter per backend that produces this type - and this package stays free of
++ * their JSON and their naming.
++ */
++data class ToolCall(
++    val name: String,
++    /** Flat arguments; nested structures are up to the adapter to flatten. */
++    val input: Map<String, String> = emptyMap(),
++)
++
++/**
++ * Maps a [ToolCall] to a [PolicyOperation] using the tool name and a handful of conventional argument
++ * keys.
++ *
++ * This is a heuristic and is documented as one: an unrecognised tool becomes
++ * [OperationKind.UNKNOWN], which the engine treats as `MEDIUM` (ask the user) rather than letting it
++ * through. Being wrong in the unknown direction costs a prompt; being wrong in the permissive direction
++ * costs a wiped directory.
++ */
++object ToolCallMapper {
++    private val COMMAND_TOKENS = setOf("bash", "shell", "sh", "exec", "execute", "command", "terminal", "run", "script")
++    private val READ_TOKENS = setOf("read", "view", "cat", "head", "tail", "glob", "grep", "list", "ls")
++    private val WRITE_TOKENS = setOf("write", "edit", "patch", "create", "apply", "append", "replace", "multiedit")
++    private val DELETE_TOKENS = setOf("delete", "remove", "rm", "unlink", "rmdir")
++    private val NETWORK_TOKENS = setOf("fetch", "webfetch", "http", "url", "web", "browser", "curl")
++    private val PUSH_TOKENS = setOf("push", "pr", "pull", "request", "merge")
++    private val RELEASE_TOKENS = setOf("publish", "release", "deploy", "ship")
++    private val INSTALL_TOKENS = setOf("install", "dependency", "dependencies", "deps", "package")
++    private val DEVICE_TOKENS = setOf("fastboot", "flash", "adb", "sideload", "unlock")
++    private val POLICY_TOKENS = setOf("policy", "permission", "permissions", "approval", "approve", "sandbox")
++
++    private val COMMAND_KEYS = listOf("command", "cmd", "script", "shell", "input")
++    private val PATH_KEYS = listOf("path", "filePath", "file_path", "file", "filename", "target", "paths", "files")
++    private val URL_KEYS = listOf("url", "uri", "endpoint", "href")
++    private val COUNT_KEYS = listOf("fileCount", "file_count", "count", "numFiles")
++
++    fun toOperation(call: ToolCall): PolicyOperation {
++        val tokens = tokensOf(call.name)
++        val kind = kindOf(tokens)
++        val url = call.input.firstValue(URL_KEYS)
++        return PolicyOperation(
++            tool = call.name,
++            kind = kind,
++            paths = if (kind == OperationKind.RUN_COMMAND) emptyList() else pathValues(call.input),
++            command = call.input.firstValue(COMMAND_KEYS).takeIf { kind == OperationKind.RUN_COMMAND },
++            networkHosts = if (kind == OperationKind.NETWORK) listOfNotNull(url?.let(::hostOf)) else emptyList(),
++            fileCount = call.input.firstValue(COUNT_KEYS)?.toIntOrNull() ?: 0,
++        )
++    }
++
++    private fun kindOf(tokens: Set<String>): OperationKind =
++        when {
++            tokens.any { it in POLICY_TOKENS } -> OperationKind.POLICY_OVERRIDE
++            tokens.any { it in DEVICE_TOKENS } -> OperationKind.DEVICE_FLASH
++            tokens.any { it in RELEASE_TOKENS } -> OperationKind.RELEASE
++            tokens.any { it in PUSH_TOKENS } -> OperationKind.VCS_PUSH
++            tokens.any { it in INSTALL_TOKENS } -> OperationKind.INSTALL_DEPENDENCY
++            tokens.any { it in COMMAND_TOKENS } -> OperationKind.RUN_COMMAND
++            tokens.any { it in DELETE_TOKENS } -> OperationKind.DELETE_FILE
++            tokens.any { it in WRITE_TOKENS } -> OperationKind.WRITE_FILE
++            tokens.any { it in READ_TOKENS } -> OperationKind.READ_FILE
++            tokens.any { it in NETWORK_TOKENS } -> OperationKind.NETWORK
++            else -> OperationKind.UNKNOWN
++        }
++
++    /** `mcp__andcode__write_file` and `writeFile` both become `{mcp, andcode, write, file}`. */
++    private fun tokensOf(name: String): Set<String> =
++        // "$1 $2", not " ": replacing the whole match would eat the first letter of the next word
++        // ("writeFile" -> "write ile", which tokenises to nothing useful).
++        name.replace(CAMEL_BOUNDARY, "$1 $2")
++            .split(NON_LETTERS)
++            .filter { it.isNotBlank() }
++            .map { it.lowercase() }
++            .toSet()
++
++    private fun pathValues(input: Map<String, String>): List<String> =
++        PATH_KEYS.flatMap { key -> input[key]?.let(::splitPaths) ?: emptyList() }
++
++    private fun splitPaths(raw: String): List<String> =
++        raw.split('\n', ',')
++            .map { it.trim() }
++            .filter { it.isNotEmpty() }
++
++    private fun hostOf(url: String): String? {
++        val withoutScheme = url.substringAfter("://", url)
++        val authority = withoutScheme.substringBefore('/').substringBefore('?').substringBefore('#')
++        val host = authority.substringAfterLast('@').substringBefore(':')
++        return host.takeIf { it.isNotBlank() }
++    }
++
++    private fun Map<String, String>.firstValue(keys: List<String>): String? =
++        keys.firstNotNullOfOrNull { this[it]?.takeIf(String::isNotBlank) }
++
++    private val CAMEL_BOUNDARY = Regex("([a-z0-9])([A-Z])")
++    private val NON_LETTERS = Regex("[^A-Za-z0-9]+")
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskLimits.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskLimits.kt
+new file mode 100644
+index 0000000..9c201f5
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskLimits.kt
+@@ -0,0 +1,29 @@
++package com.yugahashimoto.andcode.core.task
++
++/**
++ * The hard stops on a task.
++ *
++ * Every one of these exists because an agent loop without a stop condition is how a phone ends up
++ * burning a battery on a retry storm, or re-running a publish step someone already did. The values are
++ * per-task settings, not something a model can raise from inside the task it is running.
++ */
++data class TaskLimits(
++    /** Total attempts allowed for the task as a whole, retries included. */
++    val maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
++    /** Wall-clock budget for the task, measured from [TaskProgress.startedAtMs]. */
++    val maxWallClockMs: Long = DEFAULT_MAX_WALL_CLOCK_MS,
++    /** Steps recorded before the trail stops growing; the newest are kept. */
++    val maxSteps: Int = DEFAULT_MAX_STEPS,
++) {
++    init {
++        require(maxAttempts > 0) { "maxAttempts must be positive" }
++        require(maxWallClockMs > 0) { "maxWallClockMs must be positive" }
++        require(maxSteps > 0) { "maxSteps must be positive" }
++    }
++
++    companion object {
++        const val DEFAULT_MAX_ATTEMPTS = 3
++        const val DEFAULT_MAX_WALL_CLOCK_MS = 30L * 60L * 1000L
++        const val DEFAULT_MAX_STEPS = 200
++    }
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt
+new file mode 100644
+index 0000000..b1ee0fc
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt
+@@ -0,0 +1,67 @@
++package com.yugahashimoto.andcode.core.task
++
++/** Where one step of a task stands. */
++enum class StepState {
++    PENDING,
++    RUNNING,
++    DONE,
++    FAILED,
++    SKIPPED,
++}
++
++/**
++ * One unit of work in a task.
++ *
++ * [sideEffecting] is the field the resume rules pivot on: a step that writes files, pushes a branch or
++ * publishes something cannot simply be run again after the app died mid-flight, because the previous
++ * attempt may already have landed. Steps without side effects are safe to repeat, so they are.
++ */
++data class TaskStep(
++    val id: String,
++    val state: StepState = StepState.PENDING,
++    val sideEffecting: Boolean = false,
++    val attempts: Int = 0,
++    val startedAtMs: Long? = null,
++    val finishedAtMs: Long? = null,
++) {
++    /** Started and never finished: the process died, or the step is still in flight. */
++    val isInFlight: Boolean get() = state == StepState.RUNNING
++}
++
++/**
++ * Everything needed to resume a task after the app was closed, and to explain what already happened.
++ *
++ * Plain data with no Android or serialization dependency, so a repository can persist it however it
++ * likes (and so the rules below can be unit tested without one).
++ */
++data class TaskProgress(
++    val state: TaskState,
++    val steps: List<TaskStep> = emptyList(),
++    /** Attempts already spent, counted from the start of the task. */
++    val attempts: Int = 0,
++    val startedAtMs: Long,
++    /** When the task was paused, if it was; the clock for the expiry check. */
++    val pausedAtMs: Long? = null,
++) {
++    val completedSteps: List<TaskStep> get() = steps.filter { it.state == StepState.DONE }
++
++    val openSteps: List<TaskStep> get() = steps.filter { it.state == StepState.PENDING || it.state == StepState.FAILED }
++
++    val inFlightSteps: List<TaskStep> get() = steps.filter { it.isInFlight }
++
++    /** Steps whose in-flight state means "we do not know whether this landed". */
++    val unverifiedSideEffects: List<TaskStep> get() = steps.filter { it.isInFlight && it.sideEffecting }
++
++    /** Replaces [stepId] in place, appending nothing the trail does not already have. */
++    fun withStep(step: TaskStep): TaskProgress = copy(steps = steps.map { if (it.id == step.id) step else it })
++
++    /** Adds a step, trimming the oldest once [TaskLimits.maxSteps] would be exceeded. */
++    fun withNewStep(
++        step: TaskStep,
++        limits: TaskLimits,
++    ): TaskProgress {
++        val appended = steps + step
++        val trimmed = if (appended.size > limits.maxSteps) appended.takeLast(limits.maxSteps) else appended
++        return copy(steps = trimmed)
++    }
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskResume.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskResume.kt
+new file mode 100644
+index 0000000..265f76b
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskResume.kt
+@@ -0,0 +1,184 @@
++package com.yugahashimoto.andcode.core.task
++
++/** Why a saved task cannot simply be picked up again. */
++enum class ResumeBlock {
++    /** Nothing to resume: the task already shipped or was cancelled. */
++    ALREADY_TERMINAL,
++
++    /** [TaskLimits.maxAttempts] attempts are spent; the user has to raise it or start over. */
++    ATTEMPTS_EXHAUSTED,
++
++    /** [TaskLimits.maxWallClockMs] of wall clock is gone. */
++    EXPIRED,
++
++    /** Every step finished or was skipped, but the task never reached a success state. */
++    NOTHING_TO_RUN,
++}
++
++/**
++ * What resuming a task would do.
++ *
++ * [stepsNeedingConfirmation] is the point of the whole type: those steps were running when the app
++ * stopped and they have side effects, so the app cannot know whether the write, push or publish
++ * already landed. They are never re-run automatically; the user confirms or abandons each one.
++ */
++sealed interface ResumePlan {
++    data class Resumable(
++        val stepsToRun: List<String>,
++        val stepsNeedingConfirmation: List<String>,
++        val completedSteps: List<String>,
++    ) : ResumePlan {
++        /** True when resume can go ahead without asking anything. */
++        val runsWithoutConfirmation: Boolean get() = stepsNeedingConfirmation.isEmpty()
++
++        fun report(): String =
++            "${completedSteps.size} done, ${stepsToRun.size} to run, " +
++                "${stepsNeedingConfirmation.size} awaiting confirmation"
++    }
++
++    data class Blocked(
++        val reason: ResumeBlock,
++        val detail: String,
++    ) : ResumePlan
++}
++
++/** Result of asking to resume. [progress] is unchanged when the plan is [ResumePlan.Blocked]. */
++data class ResumeOutcome(
++    val plan: ResumePlan,
++    val progress: TaskProgress,
++) {
++    val resumed: Boolean get() = plan is ResumePlan.Resumable
++}
++
++/** Result of asking to cancel. */
++sealed interface CancelOutcome {
++    /** [stepsToStop] are the steps whose in-flight work the caller should actually kill. */
++    data class Cancelled(
++        val progress: TaskProgress,
++        val stepsToStop: List<String>,
++    ) : CancelOutcome
++
++    data class Refused(val reason: TransitionRejection) : CancelOutcome
++}
++
++/**
++ * Resume, confirmation and cancellation rules for a saved task.
++ *
++ * Kept beside [TaskStateMachine] rather than inside it: the machine answers "may this state change",
++ * this object answers "what does the saved file mean after a restart". Both are pure Kotlin.
++ *
++ * The wall-clock budget is counted from [TaskProgress.startedAtMs] and pausing does not refill it, so a
++ * task that has been alive for longer than [TaskLimits.maxWallClockMs] stays expired across restarts.
++ * That is deliberate: a budget that resets on resume is not a budget.
++ */
++object TaskResume {
++    fun plan(
++        progress: TaskProgress,
++        now: Long,
++        limits: TaskLimits = TaskLimits(),
++    ): ResumePlan {
++        if (progress.state.isTerminal) {
++            return ResumePlan.Blocked(ResumeBlock.ALREADY_TERMINAL, "task is ${progress.state.name}")
++        }
++        if (progress.attempts >= limits.maxAttempts) {
++            return ResumePlan.Blocked(
++                ResumeBlock.ATTEMPTS_EXHAUSTED,
++                "${progress.attempts}/${limits.maxAttempts} attempts used",
++            )
++        }
++        val elapsed = now - progress.startedAtMs
++        if (elapsed > limits.maxWallClockMs) {
++            return ResumePlan.Blocked(ResumeBlock.EXPIRED, "elapsed ${elapsed}ms of ${limits.maxWallClockMs}ms")
++        }
++
++        // A step with no side effects can be repeated, so an interrupted one simply runs again. A
++        // side-effecting one cannot: it waits for confirmSideEffect()/abandonSideEffect().
++        val toRun =
++            progress.steps
++                .filter { it.state == StepState.PENDING || it.state == StepState.FAILED || (it.isInFlight && !it.sideEffecting) }
++                .map { it.id }
++        val toConfirm = progress.unverifiedSideEffects.map { it.id }
++        if (toRun.isEmpty() && toConfirm.isEmpty()) {
++            return ResumePlan.Blocked(ResumeBlock.NOTHING_TO_RUN, "no open steps remain")
++        }
++        return ResumePlan.Resumable(
++            stepsToRun = toRun,
++            stepsNeedingConfirmation = toConfirm,
++            completedSteps = progress.completedSteps.map { it.id },
++        )
++    }
++
++    /**
++     * Applies a [ResumePlan.Resumable]: one attempt is spent, the task goes back to
++     * [TaskState.RUNNING], and interrupted non-side-effecting steps are reset so they run again.
++     *
++     * Returns the progress unchanged for a blocked plan, or when the state machine refuses the
++     * transition (a task that is not in a resumable state).
++     *
++     * [TaskFacts.approved] is passed as true on purpose: the only states that reach [TaskState.RUNNING]
++     * in the machine's table are READY, PAUSED and FAILED, and AWAITING_APPROVAL is not one of them - so
++     * approval was already granted before this task could be paused, failed or started.
++     */
++    fun begin(
++        progress: TaskProgress,
++        plan: ResumePlan,
++    ): ResumeOutcome {
++        if (plan !is ResumePlan.Resumable) return ResumeOutcome(plan, progress)
++        if (!TaskStateMachine.transition(progress.state, TaskState.RUNNING, TaskFacts(approved = true)).accepted) {
++            return ResumeOutcome(plan, progress)
++        }
++        val reset =
++            progress.steps.map { step ->
++                if (step.isInFlight && !step.sideEffecting) {
++                    step.copy(state = StepState.PENDING, finishedAtMs = null)
++                } else {
++                    step
++                }
++            }
++        return ResumeOutcome(plan, progress.copy(state = TaskState.RUNNING, attempts = progress.attempts + 1, steps = reset))
++    }
++
++    /** The user checked that a side-effecting step already landed (or wants it re-run): queue it again. */
++    fun confirmSideEffect(
++        progress: TaskProgress,
++        stepId: String,
++    ): TaskProgress = resetInflightSideEffect(progress, stepId, StepState.PENDING)
++
++    /** The user says the in-flight side effect should not be re-run: keep it out of the run. */
++    fun abandonSideEffect(
++        progress: TaskProgress,
++        stepId: String,
++    ): TaskProgress = resetInflightSideEffect(progress, stepId, StepState.SKIPPED)
++
++    /**
++     * Cancels the task, and reports which steps the caller has to actually stop.
++     *
++     * A cancellation that only hides the UI is not a cancellation, so the in-flight step ids come back
++     * with the result and are recorded as skipped here.
++     */
++    fun cancel(
++        progress: TaskProgress,
++        now: Long,
++    ): CancelOutcome {
++        val transition = TaskStateMachine.transition(progress.state, TaskState.CANCELLED)
++        if (transition !is TransitionResult.Allowed) {
++            return CancelOutcome.Refused((transition as TransitionResult.Rejected).reason)
++        }
++        val toStop = progress.inFlightSteps.map { it.id }
++        val stopped =
++            progress.steps.map { step ->
++                if (step.isInFlight) step.copy(state = StepState.SKIPPED, finishedAtMs = now) else step
++            }
++        return CancelOutcome.Cancelled(progress.copy(state = TaskState.CANCELLED, steps = stopped), toStop)
++    }
++
++    private fun resetInflightSideEffect(
++        progress: TaskProgress,
++        stepId: String,
++        to: StepState,
++    ): TaskProgress {
++        val step = progress.steps.firstOrNull { it.id == stepId }
++        if (step == null || !step.isInFlight) return progress
++        return progress.withStep(step.copy(state = to, startedAtMs = null, finishedAtMs = null))
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/policy/ToolCallMapperTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/policy/ToolCallMapperTest.kt
+new file mode 100644
+index 0000000..f838635
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/policy/ToolCallMapperTest.kt
+@@ -0,0 +1,88 @@
++package com.yugahashimoto.andcode.core.policy
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ToolCallMapperTest {
++    private fun map(
++        name: String,
++        vararg input: Pair<String, String>,
++    ): PolicyOperation = ToolCallMapper.toOperation(ToolCall(name, mapOf(*input)))
++
++    @Test
++    fun `a shell tool keeps its command`() {
++        val operation = map("bash", "command" to "git status")
++        assertEquals(OperationKind.RUN_COMMAND, operation.kind)
++        assertEquals("git status", operation.command)
++    }
++
++    @Test
++    fun `an mcp-prefixed write tool maps to a file write`() {
++        val operation = map("mcp__andcode__write_file", "filePath" to "/workspace/app/A.kt")
++        assertEquals(OperationKind.WRITE_FILE, operation.kind)
++        assertEquals(listOf("/workspace/app/A.kt"), operation.paths)
++        assertNull(operation.command)
++    }
++
++    @Test
++    fun `a camel case tool name is tokenised too`() {
++        assertEquals(OperationKind.WRITE_FILE, map("writeFile", "path" to "/workspace/a.kt").kind)
++        assertEquals(OperationKind.READ_FILE, map("readFile", "path" to "/workspace/a.kt").kind)
++    }
++
++    @Test
++    fun `newline separated paths are split`() {
++        val operation = map("write", "paths" to "/workspace/a.kt\n/workspace/b.kt")
++        assertEquals(listOf("/workspace/a.kt", "/workspace/b.kt"), operation.paths)
++    }
++
++    @Test
++    fun `deletes, pushes, releases and installs keep their kind`() {
++        assertEquals(OperationKind.DELETE_FILE, map("delete_file", "path" to "/workspace/x").kind)
++        assertEquals(OperationKind.VCS_PUSH, map("git_push", "command" to "git push").kind)
++        assertEquals(OperationKind.RELEASE, map("npm_publish").kind)
++        assertEquals(OperationKind.INSTALL_DEPENDENCY, map("add_dependency", "package" to "okhttp").kind)
++        assertEquals(OperationKind.DEVICE_FLASH, map("fastboot_flash").kind)
++        assertEquals(OperationKind.POLICY_OVERRIDE, map("update_permissions").kind)
++    }
++
++    @Test
++    fun `a network tool reports its host`() {
++        val operation = map("webfetch", "url" to "https://api.example.com:8443/v1?q=1")
++        assertEquals(OperationKind.NETWORK, operation.kind)
++        assertEquals(listOf("api.example.com"), operation.networkHosts)
++    }
++
++    @Test
++    fun `an unknown tool stays unknown`() {
++        assertEquals(OperationKind.UNKNOWN, map("mystery_tool", "whatever" to "x").kind)
++    }
++
++    @Test
++    fun `a file count hint is carried through`() {
++        val operation = map("write", "path" to "/workspace/a.kt", "fileCount" to "25")
++        assertEquals(25, operation.fileCount)
++        assertEquals(25, operation.touchedFileCount)
++    }
++
++    @Test
++    fun `mapping and assessment together refuse a destructive shell call`() {
++        val assessment = RiskEngine.assess(map("bash", "command" to "rm -rf /"), PolicyConfig())
++        assertEquals(PolicyDecision.DENY, assessment.decision)
++    }
++
++    @Test
++    fun `mapping and assessment together refuse a credential write`() {
++        val assessment = RiskEngine.assess(map("write", "path" to "/workspace/project/.env"), PolicyConfig())
++        assertEquals(PolicyDecision.DENY, assessment.decision)
++        assertTrue(assessment.codes.contains(PolicyReasonCode.SECRET_PATH))
++    }
++
++    @Test
++    fun `mapping and assessment together allow an ordinary workspace edit`() {
++        val assessment = RiskEngine.assess(map("edit", "path" to "/workspace/project/Main.kt"), PolicyConfig())
++        assertEquals(PolicyDecision.ALLOW, assessment.decision)
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskResumeTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskResumeTest.kt
+new file mode 100644
+index 0000000..1f8311b
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskResumeTest.kt
+@@ -0,0 +1,134 @@
++package com.yugahashimoto.andcode.core.task
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class TaskResumeTest {
++    private val start = 1_000_000L
++
++    private fun progress(
++        state: TaskState = TaskState.PAUSED,
++        steps: List<TaskStep> = emptyList(),
++        attempts: Int = 0,
++    ) = TaskProgress(state = state, steps = steps, attempts = attempts, startedAtMs = start)
++
++    private val editStep = TaskStep("edit-1", StepState.DONE, sideEffecting = true, finishedAtMs = start + 10)
++    private val testStep = TaskStep("test-1", StepState.PENDING)
++    private val inFlightWrite = TaskStep("write-1", StepState.RUNNING, sideEffecting = true, startedAtMs = start + 20)
++    private val inFlightRead = TaskStep("scan-1", StepState.RUNNING, sideEffecting = false, startedAtMs = start + 20)
++
++    @Test
++    fun `resuming reports what is done, what runs and what needs confirmation`() {
++        val plan = TaskResume.plan(progress(steps = listOf(editStep, testStep, inFlightWrite, inFlightRead)), start + 100, TaskLimits())
++
++        assertTrue(plan is ResumePlan.Resumable)
++        val resumable = plan as ResumePlan.Resumable
++        assertEquals(listOf("edit-1"), resumable.completedSteps)
++        assertEquals(listOf("test-1", "scan-1"), resumable.stepsToRun)
++        assertEquals(listOf("write-1"), resumable.stepsNeedingConfirmation)
++        assertFalse(resumable.runsWithoutConfirmation)
++        assertTrue(resumable.report().contains("awaiting confirmation"))
++    }
++
++    @Test
++    fun `an interrupted side effect is never re-run automatically`() {
++        val plan = TaskResume.plan(progress(steps = listOf(inFlightWrite)), start + 100, TaskLimits()) as ResumePlan.Resumable
++        assertFalse(plan.stepsToRun.contains("write-1"))
++        assertEquals(listOf("write-1"), plan.stepsNeedingConfirmation)
++    }
++
++    @Test
++    fun `confirming a side effect queues it and abandoning it skips it`() {
++        val current = progress(steps = listOf(inFlightWrite))
++        val confirmed = TaskResume.confirmSideEffect(current, "write-1")
++        assertEquals(StepState.PENDING, confirmed.steps.single().state)
++        assertEquals(null, confirmed.steps.single().finishedAtMs)
++
++        val abandoned = TaskResume.abandonSideEffect(current, "write-1")
++        assertEquals(StepState.SKIPPED, abandoned.steps.single().state)
++    }
++
++    @Test
++    fun `confirming a step that is not in flight changes nothing`() {
++        val current = progress(steps = listOf(testStep))
++        assertEquals(current, TaskResume.confirmSideEffect(current, "test-1"))
++        assertEquals(current, TaskResume.confirmSideEffect(current, "missing"))
++    }
++
++    @Test
++    fun `begin spends one attempt and resets only the repeatable steps`() {
++        val current = progress(steps = listOf(editStep, testStep, inFlightWrite, inFlightRead))
++        val plan = TaskResume.plan(current, start + 100, TaskLimits())
++        val outcome = TaskResume.begin(current, plan)
++
++        assertTrue(outcome.resumed)
++        assertEquals(TaskState.RUNNING, outcome.progress.state)
++        assertEquals(1, outcome.progress.attempts)
++        val byId = outcome.progress.steps.associateBy { it.id }
++        assertEquals(StepState.PENDING, byId.getValue("scan-1").state)
++        assertEquals(StepState.RUNNING, byId.getValue("write-1").state)
++        assertEquals(StepState.DONE, byId.getValue("edit-1").state)
++    }
++
++    @Test
++    fun `a finished task cannot be resumed`() {
++        val plan = TaskResume.plan(progress(state = TaskState.SHIPPED, steps = listOf(testStep)), start + 100, TaskLimits())
++        assertEquals(ResumeBlock.ALREADY_TERMINAL, (plan as ResumePlan.Blocked).reason)
++    }
++
++    @Test
++    fun `spent attempts block a resume`() {
++        val plan = TaskResume.plan(progress(steps = listOf(testStep), attempts = 3), start + 100, TaskLimits())
++        assertEquals(ResumeBlock.ATTEMPTS_EXHAUSTED, (plan as ResumePlan.Blocked).reason)
++    }
++
++    @Test
++    fun `pausing does not refill the wall clock budget`() {
++        val old = TaskProgress(state = TaskState.PAUSED, steps = listOf(testStep), startedAtMs = start, pausedAtMs = start + 5)
++        val plan = TaskResume.plan(old, start + TaskLimits.DEFAULT_MAX_WALL_CLOCK_MS + 1, TaskLimits())
++        assertEquals(ResumeBlock.EXPIRED, (plan as ResumePlan.Blocked).reason)
++    }
++
++    @Test
++    fun `a task with nothing left to run is not reported as resumable`() {
++        val plan = TaskResume.plan(progress(steps = listOf(editStep)), start + 100, TaskLimits())
++        assertEquals(ResumeBlock.NOTHING_TO_RUN, (plan as ResumePlan.Blocked).reason)
++    }
++
++    @Test
++    fun `a blocked plan leaves the progress untouched`() {
++        val current = progress(state = TaskState.CANCELLED, steps = listOf(testStep))
++        val plan = TaskResume.plan(current, start + 100, TaskLimits())
++        val outcome = TaskResume.begin(current, plan)
++        assertFalse(outcome.resumed)
++        assertEquals(current, outcome.progress)
++    }
++
++    @Test
++    fun `cancelling reports the steps the caller has to stop`() {
++        val current = progress(state = TaskState.RUNNING, steps = listOf(testStep, inFlightWrite, inFlightRead))
++        val outcome = TaskResume.cancel(current, start + 200) as CancelOutcome.Cancelled
++
++        assertEquals(listOf("write-1", "scan-1"), outcome.stepsToStop)
++        assertEquals(TaskState.CANCELLED, outcome.progress.state)
++        assertTrue(outcome.progress.steps.filter { it.id != "test-1" }.all { it.state == StepState.SKIPPED })
++        assertEquals(start + 200, outcome.progress.steps.first { it.id == "write-1" }.finishedAtMs)
++    }
++
++    @Test
++    fun `cancelling a terminal task is refused`() {
++        val outcome = TaskResume.cancel(progress(state = TaskState.SHIPPED, steps = listOf(testStep)), start + 200)
++        assertEquals(TransitionRejection.ILLEGAL_TRANSITION, (outcome as CancelOutcome.Refused).reason)
++    }
++
++    @Test
++    fun `recording steps respects the trail limit by keeping the newest`() {
++        val limits = TaskLimits(maxSteps = 2)
++        var current = progress(steps = emptyList())
++        repeat(3) { index -> current = current.withNewStep(TaskStep("s$index"), limits) }
++
++        assertEquals(listOf("s1", "s2"), current.steps.map { it.id })
++    }
++}
+diff --git a/docs/POLICY_ENGINE.md b/docs/POLICY_ENGINE.md
+index c14ca66..321b57c 100644
+--- a/docs/POLICY_ENGINE.md
++++ b/docs/POLICY_ENGINE.md
+@@ -19,10 +19,13 @@ is meant to be wired in.
+ | `PolicyPaths.kt` | Guest path canonicalisation, containment and glob-lite matching |
+ | `RiskAssessment.kt` | `PolicyDecision` (`ALLOW` / `REQUIRE_APPROVAL` / `DENY`), reason codes, reasons |
+ | `PolicyAuditLog.kt` | Bounded in-memory trail of decisions, with redacted summaries and codes only |
++| `ToolCallMapper.kt` | `ToolCall(name, flat args)` → `PolicyOperation`, the CLI-independent half of the wiring |
+ | `core/task/TaskState.kt` | The task states the UI shows, plus `TaskFacts` |
+ | `core/task/TaskStateMachine.kt` | Allowed transitions and the guards on them |
++| `core/task/TaskProgress.kt`, `TaskLimits.kt`, `TaskResume.kt` | Saved state, hard stops, and the resume/confirm/cancel rules |
+ 
+-Tests: `RiskEngineTest`, `CommandInspectorTest`, `PolicyAuditLogTest`, `TaskStateMachineTest`.
++Tests: `RiskEngineTest`, `CommandInspectorTest`, `PolicyAuditLogTest`, `ToolCallMapperTest`,
++`TaskStateMachineTest`, `TaskResumeTest`.
+ 
+ ## Decisions
+ 
+@@ -49,6 +52,23 @@ Tests: `RiskEngineTest`, `CommandInspectorTest`, `PolicyAuditLogTest`, `TaskStat
+   `READY_TO_SHIP` / `SHIPPED` require `approved`. Terminal states have no outgoing transitions, so a
+   shipped or cancelled task cannot be reported as successful afterwards.
+ 
++## Resume, confirmation and cancellation
++
++`TaskResume` answers "what does the saved file mean after a restart", which the state machine alone
++cannot:
++
++- **An interrupted side-effecting step is never re-run automatically.** A step that was `RUNNING` when
++  the process died may already have written, pushed or published. It comes back in
++  `ResumePlan.Resumable.stepsNeedingConfirmation` and waits for `confirmSideEffect()` (queue it again)
++  or `abandonSideEffect()` (skip it).
++- Steps *without* side effects are simply reset to `PENDING` and run again - repeating a read is free.
++- **The wall clock does not refill on resume.** The budget is counted from `startedAtMs`, so pausing
++  and resuming does not hand a stuck task a second budget. `attempts`, `maxAttempts`, `maxWallClockMs`
++  and `maxSteps` are `TaskLimits`, not fields a model writes.
++- **Cancellation reports what to kill.** `TaskResume.cancel()` returns the ids of the in-flight steps
++  and marks them `SKIPPED`, so a caller that hides the UI without stopping the work is visibly wrong
++  rather than silently wrong.
++
+ ## Command inspection limits (read this before trusting it)
+ 
+ `CommandInspector` is a pattern matcher, not a shell parser:
+@@ -68,16 +88,23 @@ sandbox with a seccomp/bind-mount policy; that is out of scope here and is not c
+ ## Wiring it in (next change, not in this one)
+ 
+ Nothing calls the engine yet: no UI reads a `RiskAssessment` and no permission request is answered by
+-it. That is deliberate — this change is the tested core, so the integration can be reviewed on its own.
+-The intended seam is the existing approval path:
+-
+-1. Where a backend surfaces `core.api.PermissionRequest` (and `ClaudePermissionBridge`'s pending
+-   requests), map the tool name and input to a `PolicyOperation`. That mapping is the only place that
+-   knows about individual CLIs.
+-2. `RiskEngine.assess(operation, configFromSettings)` → `ALLOW` answers the request the way the
+-   existing "always" path does, `REQUIRE_APPROVAL` shows the current approval sheet with the level and
+-   reasons attached, `DENY` answers with `PermissionResponse.REJECT` and says why.
++it. That is deliberate — these changes are the tested core, so the integration can be reviewed on its
++own. What already exists for that integration is `ToolCallMapper`, which turns a `ToolCall(name, args)`
++into a `PolicyOperation` without knowing which CLI produced it (`mcp__andcode__write_file`, `writeFile`
++and `write_file` all land on `WRITE_FILE`; an unrecognised tool landing on `UNKNOWN`, i.e. "ask").
++
++The remaining work, in order:
++
++1. One adapter per backend that produces `ToolCall` from its own payload: OpenCode's
++   `core.api.PermissionRequest`, `ClaudePermissionBridge`'s pending requests, Antigravity, Codex. This is
++   the only place that knows about individual CLIs.
++2. Where the approval path decides today, call
++   `RiskEngine.assess(ToolCallMapper.toOperation(call), configFromSettings)`: `ALLOW` answers the request
++   the way the existing "always" path does, `REQUIRE_APPROVAL` shows the current approval sheet with the
++   level and reasons attached, `DENY` answers with `PermissionResponse.REJECT` and says why.
+ 3. Record every verdict with `InMemoryPolicyAuditLog` and surface its snapshot next to the task report.
++4. Persist `TaskProgress` (steps + attempts + `startedAtMs`) so `TaskResume` has something to read after
++   the app is closed, and route the cancel button through `TaskResume.cancel()`.
+ 
+ Until step 1 exists in code, treat the engine as tested but not yet enforcing.
+ 
+@@ -89,4 +116,6 @@ Until step 1 exists in code, treat the engine as tested but not yet enforcing.
+ ./gradlew detekt spotlessCheck
+ ```
+ 
++77 test cases live in these two packages (plus one added to `SecretRedactionTest`).
++
+ No emulator or device is needed: the whole package is plain JVM Kotlin.
+-- 
+2.39.5
+
