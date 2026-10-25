@@ -1,0 +1,93 @@
+# Verification transcript
+# Date: 2026-10-25T20:56:08Z
+# Sandbox has no Android SDK, no gradle distribution and no Maven Central access, so Gradle
+# cannot run here. Instead the touched pure-Kotlin sources and the real committed JUnit test
+# sources were compiled with kotlinc (2.4.21) and executed against a minimal local stand-in for
+# the JUnit 4 API (org.junit.Test / org.junit.Assert). The test bodies are unmodified.
+
+$ java -version
+openjdk version "25.0.2" 2026-01-20 LTS
+$ kotlinc -version
+info: kotlinc-jvm 2.4.21 (JRE 25.0.2+10-LTS)
+
+$ kotlinc -jvm-target 17 <production + test sources> -d out
+compile exit=0
+
+$ java -cp out RunnerKt /tmp/out
+== com.yugahashimoto.andcode.core.policy.CommandInspectorTest (12 tests)
+  PASS a compound command is inspected segment by segment
+  PASS a download piped into a shell is refused
+  PASS a recursive delete of a system directory is refused but a workspace path is not
+  PASS a release build is reported as a release action
+  PASS an allowlisted host is not reported as unknown egress
+  PASS an empty command produces no findings
+  PASS credential reads are reported
+  PASS elevation is reported and does not hide the rest of the rules
+  PASS force-with-lease is not treated as a plain force push
+  PASS matching ignores case and extra whitespace
+  PASS pipes inside a quoted argument are not mistaken for a shell pipe
+  PASS read-only detection rejects redirection and substitution
+== com.yugahashimoto.andcode.core.policy.PolicyAuditLogTest (4 tests)
+  PASS a non-positive capacity is refused
+  PASS an entry keeps the codes and the redacted summary
+  PASS snapshot is a copy
+  PASS the trail keeps only the newest entries
+== com.yugahashimoto.andcode.core.policy.RiskEngineTest (23 tests)
+  PASS a bulk change needs approval even when every path is inside the workspace
+  PASS a credential echoed by a rule detail is redacted before it is stored
+  PASS a force push to a protected branch is reported as both rules
+  PASS a known read-only command is low risk
+  PASS a token inside a command never reaches the reasons or the summary
+  PASS a traversal out of the workspace cannot pass as an inside write
+  PASS a write inside the workspace is low risk and runs without asking
+  PASS a write outside the workspace needs approval
+  PASS an operation that trips nothing says so instead of returning an empty reason list
+  PASS an ordinary shell command needs approval
+  PASS an unclassified tool needs approval
+  PASS asking to skip the permission gate is refused
+  PASS auto approving medium risk still cannot approve a denial
+  PASS deleting outside the workspace is critical
+  PASS device flashing is refused rather than merely approved
+  PASS egress to an unknown host needs approval and an allowlisted host does not
+  PASS piping a download into a shell is refused
+  PASS privileged execution is high risk
+  PASS reading ssh material needs approval but is not refused
+  PASS removing a build directory inside the workspace is not fatal
+  PASS wiping the root filesystem is refused
+  PASS writing a credential file is refused outright
+  PASS writing git config is protected
+== com.yugahashimoto.andcode.core.security.SecretRedactionTest (15 tests)
+  PASS leaves ordinary text untouched
+  PASS redact also strips query strings from urls embedded in arbitrary text
+  PASS redacts a bearer authorization header
+  PASS redacts a credential passed as a cli flag
+  PASS redacts a github token
+  PASS redacts a password field
+  PASS redacts a project-scoped OpenAI style api key with hyphens in the body
+  PASS redacts a quoted json credential field
+  PASS redacts an Anthropic style api key
+  PASS redacts credentials embedded in a url userinfo
+  PASS redacts env-style api key and refresh token names
+  PASS redacts every pair of a cookie header
+  PASS redacts the credential behind a Basic authorization header
+  PASS strips oauth query parameters from urls before logging
+  PASS url without a query string is returned unchanged
+== com.yugahashimoto.andcode.core.task.TaskStateMachineTest (11 tests)
+  PASS a cancelled task cannot report success
+  PASS a failure can be retried from inspection or straight back into execution
+  PASS a finished task cannot be restarted
+  PASS a paused task can resume into the work states
+  PASS a stale failure blocks the success claim even when checks look green
+  PASS checks passed needs the checks to actually be green
+  PASS execution needs approval
+  PASS release needs approval even after a green review
+  PASS skipping verification to report success is illegal
+  PASS terminal states are recognised
+  PASS the full happy path is allowed
+== org.junit.Test (0 tests)
+
+RESULT passed=65 failed=0
+run exit=0
+
+# Style checks the sandbox could not run through Gradle: line length / trailing whitespace / final newline
+files checked=15 issues=0
