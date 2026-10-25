@@ -1,0 +1,1191 @@
+From 6c8a9059bea8a0fe8efeacf28414543372171d4a Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Sun, 25 Oct 2026 21:14:58 +0000
+Subject: [PATCH] feat(capability): add a validated capability registry with a
+ lifecycle
+
+Third slice: the capability system the task asks for, minus its UI.
+
+core/capability:
+- CapabilityManifest declares id/version/kind/source/minimumAppVersion/
+  contractVersion/permissions/input+output fields/limits/requiredTestIds.
+  SemVer is hand-rolled (compare only) rather than a new dependency.
+- CapabilityValidator returns issues instead of throwing, so the screen can
+  show all of them: malformed ids, duplicate ids, a contract or app version the
+  APK does not implement, a COMMAND field without RUN_SHELL_COMMAND, a PATH
+  field without a file permission, a closed path list, limits above the hard
+  caps, a workflow naming an unregistered tool, no declared tests.
+- Three permissions cannot be requested at all - READ_CREDENTIALS,
+  DEVICE_FLASH, DISABLE_POLICY - because a capability that could read
+  credentials, flash a device or turn the policy off would sit above the policy
+  engine and defeat it.
+- CapabilityRegistry enforces the lifecycle: draft -> validate -> recordTests ->
+  enable -> disable, with revoke final. enable() refuses unless validation is
+  clean, the declared tests passed, every requested permission was granted by
+  the caller, and a non-bundled manifest was reviewed. The manifest cannot
+  enable itself. Every transition is recorded with its actor.
+- Untrusted source is reported as a non-blocking issue, because the review gate
+  in enable() is what actually handles it.
+
+Still absent on purpose: persistence, the capability screen, and any execution.
+A workflow gets no shortcut through core/policy - its tool calls are assessed
+like direct ones (documented in docs/CAPABILITY_SYSTEM.md).
+
+Tests: CapabilityValidatorTest (16), CapabilityRegistryTest (15). 120 cases now
+run green locally, including the 14 pre-existing SecretRedaction tests.
+---
+ README.md                                     |   1 +
+ .../core/capability/CapabilityManifest.kt     | 181 ++++++++++++
+ .../core/capability/CapabilityRegistry.kt     | 278 ++++++++++++++++++
+ .../core/capability/CapabilityValidator.kt    | 206 +++++++++++++
+ .../core/capability/CapabilityRegistryTest.kt | 202 +++++++++++++
+ .../capability/CapabilityValidatorTest.kt     | 147 +++++++++
+ docs/CAPABILITY_SYSTEM.md                     |  75 +++++
+ 7 files changed, 1090 insertions(+)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityManifest.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistry.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityValidator.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistryTest.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityValidatorTest.kt
+ create mode 100644 docs/CAPABILITY_SYSTEM.md
+
+diff --git a/README.md b/README.md
+index f95e5ab..6ea79df 100644
+--- a/README.md
++++ b/README.md
+@@ -254,6 +254,7 @@ adb install -r app/build/outputs/apk/github/debug/app-github-debug.apk
+ - [Translation Guide](docs/TRANSLATION.md)
+ - [Device Validation Matrix](docs/device-matrix.md)
+ - [Policy & Risk Engine](docs/POLICY_ENGINE.md)
++- [Capability System](docs/CAPABILITY_SYSTEM.md)
+ 
+ ## Contributing
+ 
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityManifest.kt b/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityManifest.kt
+new file mode 100644
+index 0000000..a8aafc9
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityManifest.kt
+@@ -0,0 +1,181 @@
++package com.yugahashimoto.andcode.core.capability
++
++/**
++ * A dotted, monotonic version like `1.2.27`.
++ *
++ * Hand-rolled instead of a dependency: the app only needs to compare two versions ("is this capability
++ * newer than what the installed APK understands"), and pulling in a versioning library for that would be
++ * a build change this task explicitly asks not to make without need.
++ */
++data class SemVer(
++    val major: Int,
++    val minor: Int,
++    val patch: Int,
++) : Comparable<SemVer> {
++    override fun compareTo(other: SemVer): Int {
++        if (major != other.major) return major.compareTo(other.major)
++        if (minor != other.minor) return minor.compareTo(other.minor)
++        return patch.compareTo(other.patch)
++    }
++
++    override fun toString(): String = "$major.$minor.$patch"
++
++    companion object {
++        private val PATTERN = Regex("^(\\d{1,6})\\.(\\d{1,6})\\.(\\d{1,6})$")
++
++        /** Returns null for anything that is not a plain `major.minor.patch` triple. */
++        fun parseOrNull(raw: String): SemVer? {
++            val match = PATTERN.matchEntire(raw.trim()) ?: return null
++            return SemVer(
++                major = match.groupValues[1].toInt(),
++                minor = match.groupValues[2].toInt(),
++                patch = match.groupValues[3].toInt(),
++            )
++        }
++    }
++}
++
++/**
++ * What a capability is made of.
++ *
++ * The split decides whether enabling it needs a new APK: [DECLARATIVE_UI] and [WORKFLOW] compose existing
++ * tools and metadata, while [CORE_CHANGE] touches Kotlin, Gradle or Android permissions and therefore can
++ * never be "installed" as data.
++ */
++enum class CapabilityKind {
++    /** Screens built from known, allowed UI elements plus templates and reports. */
++    DECLARATIVE_UI,
++
++    /** A sequence of already-registered tools with declared input/output. */
++    WORKFLOW,
++
++    /** Work that runs on the user's own server or a remote workspace. */
++    REMOTE_SERVER,
++
++    /** Kotlin/Gradle/manifest changes. Ships in a new APK; listable here only as a description. */
++    CORE_CHANGE,
++    ;
++
++    /** True when this kind can be enabled without rebuilding the app. */
++    val installableAsData: Boolean get() = this != CORE_CHANGE
++}
++
++/** Where a capability came from. Anything not bundled with the APK is untrusted until reviewed. */
++enum class CapabilitySource {
++    BUNDLED,
++    WORKSPACE_FILE,
++    REMOTE_SERVER,
++    ;
++
++    val isTrustedByDefault: Boolean get() = this == BUNDLED
++}
++
++/**
++ * What a capability asks to be allowed to do.
++ *
++ * The [forbidden] entries exist because a capability that could disarm the policy, read credential
++ * material or write to a device would sit *above* the policy engine and defeat it. They are refused at
++ * validation time, so no manifest can request them whatever it claims to be.
++ */
++enum class CapabilityPermission(
++    val description: String,
++    val forbidden: Boolean = false,
++) {
++    READ_PROJECT_FILES("read files inside an approved workspace"),
++    WRITE_PROJECT_FILES("write files inside an approved workspace"),
++    RUN_SHELL_COMMAND("run a shell command through the task runner"),
++    NETWORK_EGRESS("contact a host the user allowlisted"),
++    INSTALL_DEPENDENCY("add or upgrade a dependency"),
++    MODIFY_APP_CONFIG("change one declared app setting"),
++    READ_CREDENTIALS("read credential material", forbidden = true),
++    DEVICE_FLASH("write to a device or partition", forbidden = true),
++    DISABLE_POLICY("turn the policy engine off", forbidden = true),
++}
++
++/** The value type a declared field carries. */
++enum class FieldType {
++    STRING,
++    NUMBER,
++    BOOLEAN,
++    PATH,
++    COMMAND,
++}
++
++/**
++ * One field in a declared input or output schema.
++ *
++ * [allowedValues] is a closed list rather than a free pattern on purpose: a manifest is untrusted input,
++ * and a small enum of accepted values is something the app can actually enforce.
++ */
++data class FieldSpec(
++    val name: String,
++    val type: FieldType,
++    val required: Boolean = true,
++    val allowedValues: List<String> = emptyList(),
++) {
++    val hasAllowedValues: Boolean get() = allowedValues.isNotEmpty()
++}
++
++/** Hard caps for one capability run, checked against [CapabilityLimits.HARD_CAPS] at validation. */
++data class CapabilityLimits(
++    val maxDurationMs: Long = DEFAULT_MAX_DURATION_MS,
++    val maxOutputBytes: Long = DEFAULT_MAX_OUTPUT_BYTES,
++) {
++    companion object {
++        const val DEFAULT_MAX_DURATION_MS = 120_000L
++        const val DEFAULT_MAX_OUTPUT_BYTES = 256L * 1024L
++
++        /** Ceilings the app refuses to exceed even when a manifest asks for more. */
++        val HARD_CAPS = CapabilityLimits(maxDurationMs = 600_000L, maxOutputBytes = 1024L * 1024L)
++    }
++}
++
++/** What the capability is allowed to call. Only names of already-registered tools belong here. */
++data class CapabilityDependencies(
++    val toolIds: List<String> = emptyList(),
++    /** Version of the capability contract this manifest was authored against. */
++    val contractVersion: Int = CONTRACT_VERSION,
++) {
++    companion object {
++        /** Bumped when the shape of [CapabilityManifest] changes incompatibly. */
++        const val CONTRACT_VERSION = 1
++    }
++}
++
++/**
++ * The exported description of one capability.
++ *
++ * Treated as untrusted input: [CapabilityValidator] checks it before anything is stored, and nothing here
++ * is a grant - a manifest asking for a permission does not get it, [CapabilityRegistry.enable] does.
++ */
++data class CapabilityManifest(
++    val id: String,
++    val name: String,
++    val version: SemVer,
++    val kind: CapabilityKind,
++    val source: CapabilitySource,
++    val description: String = "",
++    /** Minimum app version that understands this manifest, e.g. `1.2.27`. */
++    val minimumAppVersion: SemVer,
++    val permissions: Set<CapabilityPermission> = emptySet(),
++    val inputs: List<FieldSpec> = emptyList(),
++    val outputs: List<FieldSpec> = emptyList(),
++    val dependencies: CapabilityDependencies = CapabilityDependencies(),
++    val limits: CapabilityLimits = CapabilityLimits(),
++    /** Ids of the tests that have to pass before the capability may be enabled. */
++    val requiredTestIds: List<String> = emptyList(),
++) {
++    /** Stable line for the audit log and the capability screen. */
++    val summary: String get() = "$id@$version (${kind.name.lowercase()}, ${source.name.lowercase()})"
++}
++
++/** Recorded evidence that a capability's declared tests ran. Filled in by the app, not by the manifest. */
++data class CapabilityTestEvidence(
++    val passedTestIds: Set<String> = emptySet(),
++    val failedTestIds: Set<String> = emptySet(),
++    val ranAtMs: Long = 0,
++) {
++    fun covers(
++        requiredTestIds: List<String>,
++    ): Boolean = requiredTestIds.isNotEmpty() && requiredTestIds.all { it in passedTestIds } && failedTestIds.isEmpty()
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistry.kt b/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistry.kt
+new file mode 100644
+index 0000000..8785839
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistry.kt
+@@ -0,0 +1,278 @@
++package com.yugahashimoto.andcode.core.capability
++
++/** Where a capability is in its life. */
++enum class CapabilityState {
++    /** Known, not yet checked. */
++    DRAFT,
++
++    /** Passed [CapabilityValidator]; still not runnable. */
++    VALIDATED,
++
++    /** Its declared tests passed. */
++    TESTED,
++
++    /** Available to the agent and the UI. */
++    ENABLED,
++
++    /** Switched off by the user; can be re-enabled after revalidation. */
++    DISABLED,
++
++    /** Removed for good; keeps its history but can never be enabled again. */
++    REVOKED,
++    ;
++
++    val isRunnable: Boolean get() = this == ENABLED
++}
++
++/** Why the registry refused an operation. */
++enum class CapabilityRejection {
++    UNKNOWN_CAPABILITY,
++    STATE_NOT_ALLOWED,
++
++    /** Validation issues are still outstanding, so the manifest cannot move on. */
++    NOT_VALIDATED,
++
++    /** The declared tests have not passed, or a failure is on record. */
++    TESTS_NOT_PASSED,
++
++    /** A permission the manifest needs was not granted by the user. */
++    PERMISSION_NOT_GRANTED,
++
++    /** The source is not bundled and the user has not reviewed it yet. */
++    UNTRUSTED_SOURCE,
++
++    /** Reached [CapabilityState.REVOKED]; that is final. */
++    REVOKED,
++}
++
++/** One stored capability plus its current state and the issues last reported for it. */
++data class RegisteredCapability(
++    val manifest: CapabilityManifest,
++    val state: CapabilityState = CapabilityState.DRAFT,
++    val issues: List<CapabilityIssue> = emptyList(),
++    val testEvidence: CapabilityTestEvidence? = null,
++    /** Set once the user has explicitly reviewed a non-bundled manifest. */
++    val reviewed: Boolean = false,
++) {
++    val isRunnable: Boolean get() = state.isRunnable
++}
++
++/** Outcome of asking the registry to do something with a capability. */
++sealed interface CapabilityResult {
++    data class Success(val capability: RegisteredCapability) : CapabilityResult
++
++    data class Rejected(
++        val reason: CapabilityRejection,
++        val detail: String,
++    ) : CapabilityResult
++
++    val accepted: Boolean get() = this is Success
++}
++
++/** One recorded lifecycle change, so the capability screen can explain how it got here. */
++data class CapabilityEvent(
++    val timestampMs: Long,
++    val capabilityId: String,
++    val from: CapabilityState?,
++    val to: CapabilityState,
++    val actor: String,
++)
++
++/**
++ * Holds the capability manifests this device knows about and enforces their lifecycle.
++ *
++ * The rules that matter, all of them in code rather than in a prompt:
++ * - nothing is enabled on the manifest's own word: validation, the declared tests, the user's permission
++ *   grant and (for a non-bundled manifest) an explicit review all have to have happened;
++ * - [CapabilityState.REVOKED] is final, so a removed capability cannot be talked back into service;
++ * - a permission is granted by the caller, never read out of the manifest.
++ *
++ * In-memory and bounded like the policy audit log: persistence and the settings UI are a separate change,
++ * and pretending otherwise here would just move the gap somewhere less visible.
++ */
++class CapabilityRegistry(
++    private val maxCapabilities: Int = DEFAULT_MAX_CAPABILITIES,
++    private val clock: () -> Long = { System.currentTimeMillis() },
++) {
++    private val lock = Any()
++    private val capabilities = linkedMapOf<String, RegisteredCapability>()
++    private val events = ArrayDeque<CapabilityEvent>()
++
++    init {
++        require(maxCapabilities > 0) { "maxCapabilities must be positive" }
++    }
++
++    /** Validates [manifest] and stores it when there is nothing to report. */
++    fun draft(
++        manifest: CapabilityManifest,
++        context: CapabilityValidationContext,
++        actor: String = "user:add",
++    ): CapabilityResult {
++        synchronized(lock) {
++            if (manifest.id in capabilities) {
++                return reject(CapabilityRejection.STATE_NOT_ALLOWED, "${manifest.id} is already registered")
++            }
++            if (capabilities.size >= maxCapabilities) {
++                return reject(CapabilityRejection.STATE_NOT_ALLOWED, "capability limit $maxCapabilities reached")
++            }
++            val issues =
++                CapabilityValidator.validate(manifest, context.copy(existingIds = capabilities.keys.toSet()))
++            val registered = RegisteredCapability(manifest = manifest, issues = issues)
++            capabilities[manifest.id] = registered
++            record(manifest.id, null, CapabilityState.DRAFT, actor)
++            return CapabilityResult.Success(registered)
++        }
++    }
++
++    /** Re-runs validation, and moves the draft to [CapabilityState.VALIDATED] only when it is clean. */
++    fun validate(
++        id: String,
++        context: CapabilityValidationContext,
++        actor: String = "app:validate",
++    ): CapabilityResult =
++        synchronized(lock) {
++            val current = capabilities[id] ?: return reject(CapabilityRejection.UNKNOWN_CAPABILITY, id)
++            if (current.state != CapabilityState.DRAFT && current.state != CapabilityState.VALIDATED) {
++                return reject(CapabilityRejection.STATE_NOT_ALLOWED, "cannot validate from ${current.state.name}")
++            }
++            val issues =
++                CapabilityValidator.validate(current.manifest, context.copy(existingIds = capabilities.keys.toSet() - id))
++            if (issues.any { it.blocking }) {
++                val stored = current.copy(issues = issues)
++                capabilities[id] = stored
++                return CapabilityResult.Success(stored)
++            }
++            return move(current.copy(issues = emptyList()), CapabilityState.VALIDATED, actor)
++        }
++
++    /** Records that the declared tests ran. A failure keeps the capability out and stores the evidence. */
++    fun recordTests(
++        id: String,
++        evidence: CapabilityTestEvidence,
++        actor: String = "app:test",
++    ): CapabilityResult =
++        synchronized(lock) {
++            val current = capabilities[id] ?: return reject(CapabilityRejection.UNKNOWN_CAPABILITY, id)
++            if (current.state != CapabilityState.VALIDATED && current.state != CapabilityState.TESTED) {
++                return reject(CapabilityRejection.STATE_NOT_ALLOWED, "cannot test from ${current.state.name}")
++            }
++            val withEvidence = current.copy(testEvidence = evidence)
++            if (!evidence.covers(current.manifest.requiredTestIds)) {
++                capabilities[id] = withEvidence
++                return reject(CapabilityRejection.TESTS_NOT_PASSED, "declared tests have not all passed")
++            }
++            return move(withEvidence, CapabilityState.TESTED, actor)
++        }
++
++    /** Marks a non-bundled capability as reviewed by the user. Bundled ones do not need it. */
++    fun review(
++        id: String,
++        actor: String = "user:review",
++    ): CapabilityResult =
++        synchronized(lock) {
++            val current = capabilities[id] ?: return reject(CapabilityRejection.UNKNOWN_CAPABILITY, id)
++            if (current.state == CapabilityState.REVOKED) return reject(CapabilityRejection.REVOKED, id)
++            val updated = current.copy(reviewed = true)
++            capabilities[id] = updated
++            return CapabilityResult.Success(updated)
++        }
++
++    /**
++     * Enables a capability. [grantedPermissions] is the user's decision, not the manifest's request: a
++     * permission the manifest needs but the user did not grant blocks the enable.
++     */
++    fun enable(
++        id: String,
++        grantedPermissions: Set<CapabilityPermission>,
++        actor: String = "user:enable",
++    ): CapabilityResult =
++        synchronized(lock) {
++            val current = capabilities[id] ?: return reject(CapabilityRejection.UNKNOWN_CAPABILITY, id)
++            when (current.state) {
++                CapabilityState.REVOKED -> return reject(CapabilityRejection.REVOKED, id)
++                CapabilityState.ENABLED -> return CapabilityResult.Success(current)
++                CapabilityState.DISABLED, CapabilityState.TESTED -> Unit
++                else -> return reject(CapabilityRejection.STATE_NOT_ALLOWED, "cannot enable from ${current.state.name}")
++            }
++            val blocking = current.issues.filter { it.blocking }
++            if (blocking.isNotEmpty()) {
++                return reject(CapabilityRejection.NOT_VALIDATED, "${blocking.size} validation issue(s) outstanding")
++            }
++            val evidence = current.testEvidence
++            if (evidence == null || !evidence.covers(current.manifest.requiredTestIds)) {
++                return reject(CapabilityRejection.TESTS_NOT_PASSED, "declared tests have not all passed")
++            }
++            if (!current.manifest.source.isTrustedByDefault && !current.reviewed) {
++                return reject(CapabilityRejection.UNTRUSTED_SOURCE, "review the ${current.manifest.source.name.lowercase()} manifest first")
++            }
++            val missing = current.manifest.permissions.filterNot { it in grantedPermissions || it.forbidden }
++            if (missing.isNotEmpty()) {
++                return reject(CapabilityRejection.PERMISSION_NOT_GRANTED, missing.joinToString { it.name })
++            }
++            return move(current, CapabilityState.ENABLED, actor)
++        }
++
++    /** Switches a capability off. Its tests stay on record, but re-enabling re-checks them. */
++    fun disable(
++        id: String,
++        actor: String = "user:disable",
++    ): CapabilityResult =
++        synchronized(lock) {
++            val current = capabilities[id] ?: return reject(CapabilityRejection.UNKNOWN_CAPABILITY, id)
++            if (current.state != CapabilityState.ENABLED) {
++                return reject(CapabilityRejection.STATE_NOT_ALLOWED, "cannot disable from ${current.state.name}")
++            }
++            return move(current, CapabilityState.DISABLED, actor)
++        }
++
++    /** Removes a capability permanently. Final, by design. */
++    fun revoke(
++        id: String,
++        actor: String = "user:revoke",
++    ): CapabilityResult =
++        synchronized(lock) {
++            val current = capabilities[id] ?: return reject(CapabilityRejection.UNKNOWN_CAPABILITY, id)
++            if (current.state == CapabilityState.REVOKED) return CapabilityResult.Success(current)
++            return move(current, CapabilityState.REVOKED, actor)
++        }
++
++    fun get(id: String): RegisteredCapability? = synchronized(lock) { capabilities[id] }
++
++    /** Only the capabilities the agent is actually allowed to use right now. */
++    fun runnable(): List<RegisteredCapability> = synchronized(lock) { capabilities.values.filter { it.isRunnable } }
++
++    fun snapshot(): List<RegisteredCapability> = synchronized(lock) { capabilities.values.toList() }
++
++    fun events(): List<CapabilityEvent> = synchronized(lock) { events.toList() }
++
++    private fun move(
++        current: RegisteredCapability,
++        to: CapabilityState,
++        actor: String,
++    ): CapabilityResult {
++        val updated = current.copy(state = to)
++        capabilities[current.manifest.id] = updated
++        record(current.manifest.id, current.state, to, actor)
++        return CapabilityResult.Success(updated)
++    }
++
++    private fun record(
++        id: String,
++        from: CapabilityState?,
++        to: CapabilityState,
++        actor: String,
++    ) {
++        events.addLast(CapabilityEvent(clock(), id, from, to, actor))
++        while (events.size > MAX_EVENTS) events.removeFirst()
++    }
++
++    private fun reject(
++        reason: CapabilityRejection,
++        detail: String,
++    ) = CapabilityResult.Rejected(reason, detail)
++
++    companion object {
++        const val DEFAULT_MAX_CAPABILITIES = 50
++        const val MAX_EVENTS = 300
++    }
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityValidator.kt b/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityValidator.kt
+new file mode 100644
+index 0000000..5641550
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/capability/CapabilityValidator.kt
+@@ -0,0 +1,206 @@
++package com.yugahashimoto.andcode.core.capability
++
++/** Stable validation codes, so tests, the UI and the audit log can rely on them. */
++enum class CapabilityIssueCode {
++    INVALID_ID,
++    INVALID_NAME,
++    EMPTY_DESCRIPTION,
++    CONTRACT_VERSION_UNSUPPORTED,
++    APP_VERSION_TOO_OLD,
++    FORBIDDEN_PERMISSION,
++    DUPLICATE_FIELD,
++    INVALID_FIELD_NAME,
++    FIELD_NEEDS_PERMISSION,
++    LIMITS_ABOVE_HARD_CAP,
++    NO_REQUIRED_TESTS,
++    UNKNOWN_TOOL,
++    WORKFLOW_HAS_NO_TOOLS,
++    CORE_CHANGE_CANNOT_BE_INSTALLED,
++    UNTRUSTED_SOURCE,
++    DUPLICATE_ID,
++}
++
++/**
++ * One finding about a manifest.
++ *
++ * [blocking] separates "this manifest is wrong" from "the user still has to look at it": an untrusted
++ * source is reported so the capability screen can say so, but it is not a validator failure - it is the
++ * review gate in [CapabilityRegistry.enable] that has to be satisfied.
++ */
++data class CapabilityIssue(
++    val code: CapabilityIssueCode,
++    val detail: String,
++    val blocking: Boolean = true,
++)
++
++/** What the app knows about itself while validating: its version, and the tools it actually has. */
++data class CapabilityValidationContext(
++    val appVersion: SemVer,
++    val supportedContractVersion: Int = CapabilityDependencies.CONTRACT_VERSION,
++    val registeredToolIds: Set<String> = emptySet(),
++    /** Manifests already known to the registry, used to reject a duplicate id. */
++    val existingIds: Set<String> = emptySet(),
++)
++
++/**
++ * Checks a [CapabilityManifest] before anything is stored or enabled.
++ *
++ * Every rule here exists because of a concrete failure the task asks to prevent: a capability that
++ * quietly gains a forbidden permission, one written against a newer contract than this APK understands,
++ * a workflow that mentions a tool that does not exist, a schema that asks for a command field without the
++ * permission to run commands, or limits larger than the app will honour. Validation failures are returned,
++ * never thrown, so the UI can show all of them at once.
++ */
++object CapabilityValidator {
++    private val ID_PATTERN = Regex("^[a-z][a-z0-9]*(?:[._-][a-z0-9]+){1,3}$")
++    private val FIELD_PATTERN = Regex("^[a-zA-Z][a-zA-Z0-9_]{0,63}$")
++
++    fun validate(
++        manifest: CapabilityManifest,
++        context: CapabilityValidationContext,
++    ): List<CapabilityIssue> {
++        val issues = mutableListOf<CapabilityIssue>()
++
++        if (!ID_PATTERN.matches(manifest.id)) {
++            issues += CapabilityIssue(CapabilityIssueCode.INVALID_ID, "'${manifest.id}' is not a dotted lowercase id")
++        }
++        if (manifest.id in context.existingIds) {
++            issues += CapabilityIssue(CapabilityIssueCode.DUPLICATE_ID, "${manifest.id} is already registered")
++        }
++        if (manifest.name.isBlank() || manifest.name.length > MAX_NAME_LENGTH) {
++            issues += CapabilityIssue(CapabilityIssueCode.INVALID_NAME, "name must be 1..$MAX_NAME_LENGTH characters")
++        }
++        if (manifest.description.isBlank()) {
++            issues += CapabilityIssue(CapabilityIssueCode.EMPTY_DESCRIPTION, "a capability has to say what it does")
++        }
++        if (manifest.dependencies.contractVersion != context.supportedContractVersion) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.CONTRACT_VERSION_UNSUPPORTED,
++                    "contract ${manifest.dependencies.contractVersion}, app supports ${context.supportedContractVersion}",
++                )
++        }
++        if (manifest.minimumAppVersion > context.appVersion) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.APP_VERSION_TOO_OLD,
++                    "needs app ${manifest.minimumAppVersion}, installed ${context.appVersion}",
++                )
++        }
++
++        issues += permissionIssues(manifest)
++        issues += fieldIssues(manifest)
++        issues += limitIssues(manifest)
++
++        if (manifest.requiredTestIds.isEmpty()) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.NO_REQUIRED_TESTS,
++                    "declare at least one test id; a capability is not enabled on the manifest's word",
++                )
++        }
++        issues += dependencyIssues(manifest, context)
++
++        if (!manifest.kind.installableAsData && manifest.source != CapabilitySource.BUNDLED) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.CORE_CHANGE_CANNOT_BE_INSTALLED,
++                    "core changes ship in an APK; ${manifest.source.name.lowercase()} cannot install one",
++                )
++        }
++        if (!manifest.source.isTrustedByDefault) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.UNTRUSTED_SOURCE,
++                    "${manifest.source.name.lowercase()} capabilities need an explicit review before enabling",
++                    blocking = false,
++                )
++        }
++        return issues
++    }
++
++    private fun permissionIssues(manifest: CapabilityManifest): List<CapabilityIssue> =
++        manifest.permissions
++            .filter { it.forbidden }
++            .map { CapabilityIssue(CapabilityIssueCode.FORBIDDEN_PERMISSION, "${it.name}: ${it.description}") }
++
++    private fun fieldIssues(manifest: CapabilityManifest): List<CapabilityIssue> {
++        val issues = mutableListOf<CapabilityIssue>()
++        val allFields = manifest.inputs + manifest.outputs
++        allFields
++            .groupBy { it.name }
++            .filterValues { it.size > 1 }
++            .keys
++            .forEach { issues += CapabilityIssue(CapabilityIssueCode.DUPLICATE_FIELD, "'$it' is declared twice") }
++
++        for (field in allFields) {
++            if (!FIELD_PATTERN.matches(field.name)) {
++                issues += CapabilityIssue(CapabilityIssueCode.INVALID_FIELD_NAME, "'${field.name}' is not a valid field name")
++            }
++            if (field.hasAllowedValues && field.type == FieldType.PATH) {
++                // A closed path list is either dead weight or a bypass of the workspace rule; refuse it.
++                issues +=
++                    CapabilityIssue(
++                        CapabilityIssueCode.FIELD_NEEDS_PERMISSION,
++                        "'${field.name}': a PATH field cannot be restricted to a fixed list",
++                    )
++            }
++        }
++        // The schema and the permission set have to agree, or a capability could describe a command input
++        // while never asking for the right to run one.
++        if (allFields.any { it.type == FieldType.COMMAND } && CapabilityPermission.RUN_SHELL_COMMAND !in manifest.permissions) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.FIELD_NEEDS_PERMISSION,
++                    "a COMMAND field requires the RUN_SHELL_COMMAND permission",
++                )
++        }
++        if (allFields.any { it.type == FieldType.PATH } &&
++            manifest.permissions.none { it == CapabilityPermission.READ_PROJECT_FILES || it == CapabilityPermission.WRITE_PROJECT_FILES }
++        ) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.FIELD_NEEDS_PERMISSION,
++                    "a PATH field requires READ_PROJECT_FILES or WRITE_PROJECT_FILES",
++                )
++        }
++        return issues
++    }
++
++    private fun limitIssues(manifest: CapabilityManifest): List<CapabilityIssue> {
++        val caps = CapabilityLimits.HARD_CAPS
++        val issues = mutableListOf<CapabilityIssue>()
++        if (manifest.limits.maxDurationMs <= 0 || manifest.limits.maxDurationMs > caps.maxDurationMs) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.LIMITS_ABOVE_HARD_CAP,
++                    "maxDurationMs must be 1..${caps.maxDurationMs}",
++                )
++        }
++        if (manifest.limits.maxOutputBytes <= 0 || manifest.limits.maxOutputBytes > caps.maxOutputBytes) {
++            issues +=
++                CapabilityIssue(
++                    CapabilityIssueCode.LIMITS_ABOVE_HARD_CAP,
++                    "maxOutputBytes must be 1..${caps.maxOutputBytes}",
++                )
++        }
++        return issues
++    }
++
++    private fun dependencyIssues(
++        manifest: CapabilityManifest,
++        context: CapabilityValidationContext,
++    ): List<CapabilityIssue> {
++        val issues = mutableListOf<CapabilityIssue>()
++        if (manifest.kind == CapabilityKind.WORKFLOW && manifest.dependencies.toolIds.isEmpty()) {
++            issues += CapabilityIssue(CapabilityIssueCode.WORKFLOW_HAS_NO_TOOLS, "a workflow has to name the tools it calls")
++        }
++        manifest.dependencies.toolIds
++            .filterNot { it in context.registeredToolIds }
++            .distinct()
++            .forEach { issues += CapabilityIssue(CapabilityIssueCode.UNKNOWN_TOOL, "'$it' is not a registered tool") }
++        return issues
++    }
++
++    private const val MAX_NAME_LENGTH = 80
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistryTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistryTest.kt
+new file mode 100644
+index 0000000..1c9e96e
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityRegistryTest.kt
+@@ -0,0 +1,202 @@
++package com.yugahashimoto.andcode.core.capability
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class CapabilityRegistryTest {
++    private val context =
++        CapabilityValidationContext(
++            appVersion = SemVer(1, 2, 27),
++            registeredToolIds = setOf("read_file", "write_file"),
++        )
++    private val granted = setOf(CapabilityPermission.READ_PROJECT_FILES)
++
++    private fun manifest(
++        id: String = "andcode.release-notes",
++        source: CapabilitySource = CapabilitySource.BUNDLED,
++        permissions: Set<CapabilityPermission> = setOf(CapabilityPermission.READ_PROJECT_FILES),
++        testIds: List<String> = listOf("works-on-sample-repo"),
++    ) = CapabilityManifest(
++        id = id,
++        name = "Release notes",
++        version = SemVer(1, 0, 0),
++        kind = CapabilityKind.WORKFLOW,
++        source = source,
++        description = "summarises what changed",
++        minimumAppVersion = SemVer(1, 0, 0),
++        permissions = permissions,
++        dependencies = CapabilityDependencies(toolIds = listOf("read_file")),
++        requiredTestIds = testIds,
++    )
++
++    /** Draft + validate + test, the three steps every capability needs before it can be enabled. */
++    private fun prepared(
++        registry: CapabilityRegistry,
++        m: CapabilityManifest = manifest(),
++    ): CapabilityRegistry {
++        assertTrue(registry.draft(m, context).accepted)
++        assertTrue(registry.validate(m.id, context).accepted)
++        val evidence = CapabilityTestEvidence(passedTestIds = m.requiredTestIds.toSet(), ranAtMs = 1)
++        assertTrue(registry.recordTests(m.id, evidence).accepted)
++        return registry
++    }
++
++    @Test
++    fun `a capability cannot be enabled straight from a draft`() {
++        val registry = CapabilityRegistry()
++        registry.draft(manifest(), context)
++        val result = registry.enable("andcode.release-notes", granted)
++        assertEquals(CapabilityRejection.STATE_NOT_ALLOWED, (result as CapabilityResult.Rejected).reason)
++    }
++
++    @Test
++    fun `the full path reaches enabled and runnable`() {
++        val registry = prepared(CapabilityRegistry())
++        val result = registry.enable("andcode.release-notes", granted)
++
++        assertTrue(result.accepted)
++        assertEquals(CapabilityState.ENABLED, (result as CapabilityResult.Success).capability.state)
++        assertEquals(listOf("andcode.release-notes"), registry.runnable().map { it.manifest.id })
++        assertTrue(registry.events().any { it.to == CapabilityState.ENABLED })
++    }
++
++    @Test
++    fun `declared tests are required before enabling`() {
++        val registry = CapabilityRegistry()
++        registry.draft(manifest(), context)
++        registry.validate("andcode.release-notes", context)
++
++        val result = registry.enable("andcode.release-notes", granted)
++        assertEquals(CapabilityRejection.STATE_NOT_ALLOWED, (result as CapabilityResult.Rejected).reason)
++    }
++
++    @Test
++    fun `a failing test run keeps the capability out of service`() {
++        val registry = CapabilityRegistry()
++        val m = manifest()
++        registry.draft(m, context)
++        registry.validate(m.id, context)
++
++        val evidence = CapabilityTestEvidence(failedTestIds = setOf("works-on-sample-repo"), ranAtMs = 1)
++        val result = registry.recordTests(m.id, evidence)
++        assertEquals(CapabilityRejection.TESTS_NOT_PASSED, (result as CapabilityResult.Rejected).reason)
++        assertEquals(CapabilityState.VALIDATED, registry.get(m.id)?.state)
++    }
++
++    @Test
++    fun `a permission the user did not grant blocks the enable`() {
++        val registry = prepared(CapabilityRegistry())
++        val result = registry.enable("andcode.release-notes", grantedPermissions = emptySet())
++
++        assertEquals(CapabilityRejection.PERMISSION_NOT_GRANTED, (result as CapabilityResult.Rejected).reason)
++        assertTrue(registry.runnable().isEmpty())
++    }
++
++    @Test
++    fun `a non-bundled capability needs an explicit review`() {
++        val registry = prepared(CapabilityRegistry(), manifest(source = CapabilitySource.WORKSPACE_FILE))
++        val blocked = registry.enable("andcode.release-notes", granted)
++        assertEquals(CapabilityRejection.UNTRUSTED_SOURCE, (blocked as CapabilityResult.Rejected).reason)
++
++        registry.review("andcode.release-notes")
++        assertTrue(registry.enable("andcode.release-notes", granted).accepted)
++    }
++
++    @Test
++    fun `validation issues block the enable even after tests`() {
++        val registry = CapabilityRegistry()
++        // A workflow naming a tool this app does not have: draft stores it with the issue attached.
++        val broken = manifest().copy(dependencies = CapabilityDependencies(toolIds = listOf("ghost_tool")))
++        registry.draft(broken, context)
++        val validateResult = registry.validate(broken.id, context)
++
++        assertTrue((validateResult as CapabilityResult.Success).capability.issues.isNotEmpty())
++        assertEquals(CapabilityState.DRAFT, registry.get(broken.id)?.state)
++        val result = registry.enable(broken.id, granted)
++        assertEquals(CapabilityRejection.STATE_NOT_ALLOWED, (result as CapabilityResult.Rejected).reason)
++    }
++
++    @Test
++    fun `disabling stops it running and enabling again works`() {
++        val registry = prepared(CapabilityRegistry())
++        registry.enable("andcode.release-notes", granted)
++
++        assertTrue(registry.disable("andcode.release-notes").accepted)
++        assertTrue(registry.runnable().isEmpty())
++
++        assertTrue(registry.enable("andcode.release-notes", granted).accepted)
++        assertEquals(1, registry.runnable().size)
++    }
++
++    @Test
++    fun `revoking is final`() {
++        val registry = prepared(CapabilityRegistry())
++        registry.enable("andcode.release-notes", granted)
++        assertTrue(registry.revoke("andcode.release-notes").accepted)
++
++        val result = registry.enable("andcode.release-notes", granted)
++        assertEquals(CapabilityRejection.REVOKED, (result as CapabilityResult.Rejected).reason)
++        assertTrue(registry.runnable().isEmpty())
++    }
++
++    @Test
++    fun `a revoking of an unknown capability is reported not thrown`() {
++        val result = CapabilityRegistry().revoke("andcode.missing")
++        assertEquals(CapabilityRejection.UNKNOWN_CAPABILITY, (result as CapabilityResult.Rejected).reason)
++    }
++
++    @Test
++    fun `a duplicate draft is refused`() {
++        val registry = CapabilityRegistry()
++        registry.draft(manifest(), context)
++        val again = registry.draft(manifest(), context)
++        assertEquals(CapabilityRejection.STATE_NOT_ALLOWED, (again as CapabilityResult.Rejected).reason)
++    }
++
++    @Test
++    fun `the capability count is bounded`() {
++        val registry = CapabilityRegistry(maxCapabilities = 1)
++        registry.draft(manifest(), context)
++        val second = registry.draft(manifest(id = "andcode.second"), context)
++        assertEquals(CapabilityRejection.STATE_NOT_ALLOWED, (second as CapabilityResult.Rejected).reason)
++    }
++
++    @Test
++    fun `only enabled capabilities are exposed as runnable`() {
++        val registry = CapabilityRegistry()
++        registry.draft(manifest(id = "andcode.a"), context)
++        registry.draft(manifest(id = "andcode.b"), context)
++        prepared(registry, manifest(id = "andcode.c"))
++        registry.enable("andcode.c", granted)
++
++        assertEquals(listOf("andcode.c"), registry.runnable().map { it.manifest.id })
++        assertEquals(3, registry.snapshot().size)
++    }
++
++    @Test
++    fun `every transition is recorded with the actor`() {
++        val registry = CapabilityRegistry()
++        registry.draft(manifest(), context)
++        registry.validate("andcode.release-notes", context)
++
++        val states = registry.events().map { it.to }
++        assertEquals(listOf(CapabilityState.DRAFT, CapabilityState.VALIDATED), states)
++        assertTrue(registry.events().all { it.capabilityId == "andcode.release-notes" })
++        assertFalse(registry.events().any { it.actor.isBlank() })
++    }
++
++    @Test
++    fun `a forbidden permission never becomes an enabled capability`() {
++        val registry = CapabilityRegistry()
++        val hostile = manifest(permissions = setOf(CapabilityPermission.DISABLE_POLICY))
++        registry.draft(hostile, context)
++        registry.validate(hostile.id, context)
++        registry.recordTests(hostile.id, CapabilityTestEvidence(passedTestIds = setOf("works-on-sample-repo")))
++
++        val result = registry.enable(hostile.id, granted + CapabilityPermission.DISABLE_POLICY)
++        assertFalse(result.accepted)
++        assertTrue(registry.runnable().isEmpty())
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityValidatorTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityValidatorTest.kt
+new file mode 100644
+index 0000000..01724b6
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/capability/CapabilityValidatorTest.kt
+@@ -0,0 +1,147 @@
++package com.yugahashimoto.andcode.core.capability
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class CapabilityValidatorTest {
++    private val context =
++        CapabilityValidationContext(
++            appVersion = SemVer(1, 2, 27),
++            registeredToolIds = setOf("read_file", "write_file", "run_command"),
++        )
++
++    private fun manifest(
++        id: String = "andcode.release-notes",
++        kind: CapabilityKind = CapabilityKind.WORKFLOW,
++        source: CapabilitySource = CapabilitySource.BUNDLED,
++        permissions: Set<CapabilityPermission> = setOf(CapabilityPermission.READ_PROJECT_FILES),
++        inputs: List<FieldSpec> = emptyList(),
++        outputs: List<FieldSpec> = emptyList(),
++        toolIds: List<String> = listOf("read_file"),
++        limits: CapabilityLimits = CapabilityLimits(),
++        minimumAppVersion: SemVer = SemVer(1, 0, 0),
++        contractVersion: Int = CapabilityDependencies.CONTRACT_VERSION,
++        description: String = "summarises what changed",
++        name: String = "Release notes",
++        testIds: List<String> = listOf("works-on-sample-repo"),
++    ) = CapabilityManifest(
++        id = id,
++        name = name,
++        version = SemVer(1, 0, 0),
++        kind = kind,
++        source = source,
++        description = description,
++        minimumAppVersion = minimumAppVersion,
++        permissions = permissions,
++        inputs = inputs,
++        outputs = outputs,
++        dependencies = CapabilityDependencies(toolIds = toolIds, contractVersion = contractVersion),
++        limits = limits,
++        requiredTestIds = testIds,
++    )
++
++    private fun codes(m: CapabilityManifest) = CapabilityValidator.validate(m, context).map { it.code }
++
++    @Test
++    fun `a well formed capability has no issues`() {
++        assertEquals(emptyList<CapabilityIssueCode>(), codes(manifest()))
++    }
++
++    @Test
++    fun `an id has to be dotted lowercase`() {
++        assertTrue(CapabilityIssueCode.INVALID_ID in codes(manifest(id = "ReleaseNotes")))
++        assertTrue(CapabilityIssueCode.INVALID_ID in codes(manifest(id = "andcode")))
++        assertTrue(CapabilityIssueCode.INVALID_ID in codes(manifest(id = "andcode.release.notes.extra.deep.x")))
++    }
++
++    @Test
++    fun `a duplicate id is refused`() {
++        val withExisting = context.copy(existingIds = setOf("andcode.release-notes"))
++        val issues = CapabilityValidator.validate(manifest(), withExisting).map { it.code }
++        assertTrue(CapabilityIssueCode.DUPLICATE_ID in issues)
++    }
++
++    @Test
++    fun `a forbidden permission is refused outright`() {
++        val codes = codes(manifest(permissions = setOf(CapabilityPermission.DISABLE_POLICY)))
++        assertTrue(CapabilityIssueCode.FORBIDDEN_PERMISSION in codes)
++    }
++
++    @Test
++    fun `a capability written for a newer app is refused`() {
++        assertTrue(CapabilityIssueCode.APP_VERSION_TOO_OLD in codes(manifest(minimumAppVersion = SemVer(1, 3, 0))))
++    }
++
++    @Test
++    fun `an unknown contract version is refused`() {
++        assertTrue(CapabilityIssueCode.CONTRACT_VERSION_UNSUPPORTED in codes(manifest(contractVersion = 99)))
++    }
++
++    @Test
++    fun `a command field requires the shell permission`() {
++        val field = FieldSpec("cmd", FieldType.COMMAND)
++        assertTrue(CapabilityIssueCode.FIELD_NEEDS_PERMISSION in codes(manifest(inputs = listOf(field))))
++
++        val allowed = manifest(inputs = listOf(field), permissions = setOf(CapabilityPermission.RUN_SHELL_COMMAND))
++        assertEquals(emptyList<CapabilityIssueCode>(), codes(allowed))
++    }
++
++    @Test
++    fun `a path field requires a file permission`() {
++        val field = FieldSpec("target", FieldType.PATH)
++        val noPermission = manifest(inputs = listOf(field), permissions = emptySet())
++        assertTrue(CapabilityIssueCode.FIELD_NEEDS_PERMISSION in codes(noPermission))
++        assertTrue(CapabilityIssueCode.FIELD_NEEDS_PERMISSION !in codes(manifest(inputs = listOf(field))))
++    }
++
++    @Test
++    fun `a closed list of paths is refused`() {
++        val field = FieldSpec("target", FieldType.PATH, allowedValues = listOf("/workspace/a.kt"))
++        assertTrue(CapabilityIssueCode.FIELD_NEEDS_PERMISSION in codes(manifest(inputs = listOf(field))))
++    }
++
++    @Test
++    fun `duplicate and malformed field names are reported`() {
++        val inputs = listOf(FieldSpec("mode", FieldType.STRING), FieldSpec("mode", FieldType.STRING))
++        assertTrue(CapabilityIssueCode.DUPLICATE_FIELD in codes(manifest(inputs = inputs)))
++
++        val bad = listOf(FieldSpec("2mode", FieldType.STRING))
++        assertTrue(CapabilityIssueCode.INVALID_FIELD_NAME in codes(manifest(inputs = bad)))
++    }
++
++    @Test
++    fun `limits above the hard cap are refused`() {
++        val huge = CapabilityLimits(maxDurationMs = CapabilityLimits.HARD_CAPS.maxDurationMs + 1)
++        assertTrue(CapabilityIssueCode.LIMITS_ABOVE_HARD_CAP in codes(manifest(limits = huge)))
++    }
++
++    @Test
++    fun `a workflow has to name registered tools`() {
++        assertTrue(CapabilityIssueCode.WORKFLOW_HAS_NO_TOOLS in codes(manifest(toolIds = emptyList())))
++        assertTrue(CapabilityIssueCode.UNKNOWN_TOOL in codes(manifest(toolIds = listOf("not_a_tool"))))
++    }
++
++    @Test
++    fun `a non-bundled capability is flagged as unreviewed`() {
++        val codes = codes(manifest(source = CapabilitySource.WORKSPACE_FILE))
++        assertTrue(CapabilityIssueCode.UNTRUSTED_SOURCE in codes)
++    }
++
++    @Test
++    fun `a core change cannot arrive as data`() {
++        val codes = codes(manifest(kind = CapabilityKind.CORE_CHANGE, source = CapabilitySource.REMOTE_SERVER))
++        assertTrue(CapabilityIssueCode.CORE_CHANGE_CANNOT_BE_INSTALLED in codes)
++    }
++
++    @Test
++    fun `a capability with no declared tests is refused`() {
++        assertTrue(CapabilityIssueCode.NO_REQUIRED_TESTS in codes(manifest(testIds = emptyList())))
++    }
++
++    @Test
++    fun `an empty description or name is refused`() {
++        assertTrue(CapabilityIssueCode.EMPTY_DESCRIPTION in codes(manifest(description = "  ")))
++        assertTrue(CapabilityIssueCode.INVALID_NAME in codes(manifest(name = "")))
++    }
++}
+diff --git a/docs/CAPABILITY_SYSTEM.md b/docs/CAPABILITY_SYSTEM.md
+new file mode 100644
+index 0000000..464ee68
+--- /dev/null
++++ b/docs/CAPABILITY_SYSTEM.md
+@@ -0,0 +1,75 @@
++# Capability System
++
++`core/capability` is the registry a capability has to go through before the app will run it. It answers
++three questions in code rather than in prose:
++
++1. is this manifest acceptable at all (shape, permissions, compatibility, limits)?
++2. has it actually been tested, and did the user grant what it needs?
++3. may the agent use it *right now*?
++
++Nothing here executes a capability. It decides whether one is allowed to exist and to run, which is the
++part the task is explicit about: "the app itself must verify permissions and classify risk; asking the
++model to behave safely is not enough".
++
++## Files
++
++| File | Responsibility |
++| --- | --- |
++| `CapabilityManifest.kt` | `CapabilityManifest`, `CapabilityKind`, `CapabilitySource`, `CapabilityPermission`, `FieldSpec`, `CapabilityLimits`, `CapabilityDependencies`, `SemVer`, `CapabilityTestEvidence` |
++| `CapabilityValidator.kt` | `validate(manifest, context) → List<CapabilityIssue>` |
++| `CapabilityRegistry.kt` | Lifecycle: draft → validate → test → enable → disable → revoke, plus an event trail |
++
++Tests: `CapabilityValidatorTest` (16), `CapabilityRegistryTest` (15).
++
++## The contract
++
++A manifest declares, and is checked for:
++
++| Field | Enforced by |
++| --- | --- |
++| `id` | dotted lowercase, at most four segments, unique in the registry |
++| `version` | `major.minor.patch` (`SemVer`, no dependency) |
++| `kind` | `DECLARATIVE_UI`, `WORKFLOW`, `REMOTE_SERVER`, `CORE_CHANGE` |
++| `source` | `BUNDLED` (trusted) vs `WORKSPACE_FILE` / `REMOTE_SERVER` (need review) |
++| `minimumAppVersion` | refused when newer than the installed app |
++| `dependencies.contractVersion` | refused when it differs from what the app implements |
++| `permissions` | only non-forbidden ones; a permission is *requested* here, *granted* by the user |
++| `inputs` / `outputs` | field names, duplicate detection, `PATH`/`COMMAND` fields must match the permissions |
++| `limits` | `maxDurationMs` / `maxOutputBytes` must be positive and under `CapabilityLimits.HARD_CAPS` |
++| `requiredTestIds` | at least one; the registry will not enable without passing evidence |
++| `dependencies.toolIds` | a `WORKFLOW` must name tools, and every id must already be registered |
++
++## Decisions
++
++- **Three permissions cannot be requested at all**: `READ_CREDENTIALS`, `DEVICE_FLASH`,
++  `DISABLE_POLICY`. A capability that could read credential material, write to a device or turn the policy
++  off would sit *above* the policy engine and defeat it, so a manifest that asks is rejected at validation
++  time - before any UI offers the user a choice.
++- **Enabling is a gate, not a flag.** `enable()` refuses unless validation is clean, the declared tests
++  passed, every requested permission is in the caller's granted set, and a non-bundled manifest has been
++  reviewed. The manifest cannot enable itself, and the model cannot write any of those facts.
++- **Tests are evidence, not prose.** `CapabilityTestEvidence` is produced by running the declared ids; a
++  single failure keeps the capability out of service even if the rest passed.
++- **Revoked is final.** A removed capability keeps its history and can never be re-enabled.
++- **Advisory vs blocking issues.** An untrusted source is reported (`blocking = false`) because the
++  review gate handles it; everything else blocks the transition.
++- **`CORE_CHANGE` cannot arrive as data.** Kotlin, Gradle or permission changes need a new APK, so a
++  non-bundled `CORE_CHANGE` manifest is rejected instead of pretending a download could install one.
++- **Bounded, in memory.** 50 capabilities and 300 events; persistence and the capability screen are the
++  next change, and saying so is better than storing state badly today.
++
++## What this does *not* do
++
++- It does not sandbox anything: a `WORKFLOW` still runs through the same tools and the same
++  `core/policy` decision path, and it gets no privilege the underlying tool does not already have.
++- It does not fetch or execute code. There is no DEX/JAR/SO loading here and none should be added.
++- It does not persist across process death yet, and no UI reads it yet.
++
++## Wiring it in (next)
++
++1. An asset (or a workspace file the user imports) provides bundled manifests; `CapabilityRegistry.draft`
++   is called on startup for each, with `CapabilityValidationContext(appVersion, registeredToolIds)`.
++2. The capability screen lists `snapshot()` with `state` and `issues`, and calls `validate` / `recordTests`
++   / `review` / `enable` / `disable` / `revoke`.
++3. A `WORKFLOW` runs by expanding `dependencies.toolIds` into `ToolCall`s, each of which is assessed by
++   `RiskEngine` exactly like a direct call - the workflow gets no shortcut through the policy.
+-- 
+2.39.5
+

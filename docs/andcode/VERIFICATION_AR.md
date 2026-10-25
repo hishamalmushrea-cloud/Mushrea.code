@@ -27,15 +27,17 @@ Maven.
 ### النتيجة
 
 ```
-== core.policy.CommandInspectorTest     (12 tests)  -> 12 PASS
-== core.policy.PolicyAuditLogTest        (4 tests)  ->  4 PASS
-== core.policy.RiskEngineTest           (23 tests)  -> 23 PASS
-== core.policy.ToolCallMapperTest       (11 tests)  -> 11 PASS
-== core.security.SecretRedactionTest    (15 tests)  -> 15 PASS   (14 قائمة + 1 جديد)
-== core.task.TaskResumeTest             (13 tests)  -> 13 PASS
-== core.task.TaskStateMachineTest       (11 tests)  -> 11 PASS
+== core.capability.CapabilityRegistryTest   (15 tests) -> 15 PASS
+== core.capability.CapabilityValidatorTest  (16 tests) -> 16 PASS
+== core.policy.CommandInspectorTest         (12 tests) -> 12 PASS
+== core.policy.PolicyAuditLogTest            (4 tests) ->  4 PASS
+== core.policy.RiskEngineTest               (23 tests) -> 23 PASS
+== core.policy.ToolCallMapperTest           (11 tests) -> 11 PASS
+== core.security.SecretRedactionTest        (15 tests) -> 15 PASS   (14 قائمة + 1 جديد)
+== core.task.TaskResumeTest                 (13 tests) -> 13 PASS
+== core.task.TaskStateMachineTest           (11 tests) -> 11 PASS
 
-RESULT passed=89 failed=0
+RESULT passed=120 failed=0
 ```
 
 المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّق عليها الـ patch‑ان بـ `git am`** (لا من شجرة
@@ -51,6 +53,8 @@ RESULT passed=89 failed=0
 | `./gradlew :app:assembleRelease` لم يُصنَّف كإصدار | كان سطر الأمر يُحوَّل إلى أحرف صغيرة قبل المطابقة، والنمط مكتوب `assembleRelease` | النمط صار بأحرف صغيرة مع تعليق يوضّح العقد |
 | تفاصيل سبب قد تحمل سرًا بصيغة `--password value` | `SecretRedaction` يغطي `key=value` و`Bearer` فقط | أُضيف نمط لصيغة أعلام سطر الأوامر + اختبار له |
 | `writeFile` صُنِّف `UNKNOWN` بدل `WRITE_FILE` | فصل camelCase كان يستبدل المطابقة كلها بمسافة فتصبح `write ile` | الاستبدال صار `"$1 $2"` مع تعليق يشرح الخطأ |
+| قدرة من مصدر غير موثوق **لا يمكن تفعيلها أبدًا** حتى بعد المراجعة | كان `UNTRUSTED_SOURCE` يُسجَّل كعيب حاجب، فتعارض مع بوابة المراجعة في `enable()` | أُضيف `blocking` للعيب: المصدر غير الموثوق يُبلَّغ عنه ولا يمنع الانتقال؛ المنع في `enable()` |
+| معرّفات القدرات العميقة (`a.b.c.d.e.x`) كانت مقبولة | النمط سمح بخمسة مستويات | حُدّ النمط إلى أربعة مقاطع كحد أقصى |
 
 ### فحوص تنسيق أُجريت يدويًا (لأن spotless غير متاح)
 
@@ -62,17 +66,19 @@ RESULT passed=89 failed=0
 
 ```
 $ git clone --depth 1 https://github.com/yuga-hashimoto/and-code.git /tmp/applycheck2
-$ git am patches/0001-*.patch patches/0002-*.patch
+$ git am patches/0001-*.patch patches/0002-*.patch patches/0003-*.patch
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
-$ git log --oneline -3
-a4a8bbc feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
-df457e3 feat(policy): add an in-app risk engine and task state machine
+Applying: feat(capability): add a validated capability registry with a lifecycle
+$ git log --oneline -4
+0936c50 feat(capability): add a validated capability registry with a lifecycle
+03ed86c feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+099145d feat(policy): add an in-app risk engine and task state machine
 414c780 Merge pull request #404 from yuga-hashimoto/feat/402-edit-local-workspace-files
 ```
 
-أي أن الـ patch‑ين يُطبَّقان بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، و13 ملف إنتاج جديدًا
-موجودة بعد التطبيق.
+أي أن الـ patches الثلاثة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، و16 ملف إنتاج جديدًا
+موجودة بعد التطبيق، وتشغيل الاختبارات أعلاه جرى على هذه النسخة بالضبط.
 
 ## ما لم يُشغَّل (وهذا مذكور كقيد، لا كنجاح)
 

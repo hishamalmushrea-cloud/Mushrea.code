@@ -1,14 +1,15 @@
 # Verification transcript
-# Date: 2026-10-25T21:08:02Z
+# Date: 2026-10-25T21:15:05Z
 # Sandbox has no Android SDK, no gradle distribution and no Maven Central access, so Gradle
 # cannot run here. Instead the touched pure-Kotlin sources and the real committed JUnit test
 # sources were compiled with kotlinc (2.4.21) and executed against a minimal local stand-in for
 # the JUnit 4 API (org.junit.Test / org.junit.Assert). The test bodies are unmodified.
-# Sources are taken from a clean clone with both patches applied (git am), not from a work tree.
+# Sources are taken from a clean clone with all three patches applied (git am).
 
-$ git am 0001-*.patch 0002-*.patch   (on a fresh clone of yuga-hashimoto/and-code at 414c780)
+$ git am 0001-*.patch 0002-*.patch 0003-*.patch   (fresh clone of yuga-hashimoto/and-code @ 414c780)
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+Applying: feat(capability): add a validated capability registry with a lifecycle
 
 $ java -version
 openjdk version "25.0.2" 2026-01-20 LTS
@@ -19,6 +20,39 @@ $ kotlinc -jvm-target 17 <production + test sources> -d out
 compile exit=0
 
 $ java -cp out RunnerKt /tmp/out
+== com.yugahashimoto.andcode.core.capability.CapabilityRegistryTest (15 tests)
+  PASS a capability cannot be enabled straight from a draft
+  PASS a duplicate draft is refused
+  PASS a failing test run keeps the capability out of service
+  PASS a forbidden permission never becomes an enabled capability
+  PASS a non-bundled capability needs an explicit review
+  PASS a permission the user did not grant blocks the enable
+  PASS a revoking of an unknown capability is reported not thrown
+  PASS declared tests are required before enabling
+  PASS disabling stops it running and enabling again works
+  PASS every transition is recorded with the actor
+  PASS only enabled capabilities are exposed as runnable
+  PASS revoking is final
+  PASS the capability count is bounded
+  PASS the full path reaches enabled and runnable
+  PASS validation issues block the enable even after tests
+== com.yugahashimoto.andcode.core.capability.CapabilityValidatorTest (16 tests)
+  PASS a capability with no declared tests is refused
+  PASS a capability written for a newer app is refused
+  PASS a closed list of paths is refused
+  PASS a command field requires the shell permission
+  PASS a core change cannot arrive as data
+  PASS a duplicate id is refused
+  PASS a forbidden permission is refused outright
+  PASS a non-bundled capability is flagged as unreviewed
+  PASS a path field requires a file permission
+  PASS a well formed capability has no issues
+  PASS a workflow has to name registered tools
+  PASS an empty description or name is refused
+  PASS an id has to be dotted lowercase
+  PASS an unknown contract version is refused
+  PASS duplicate and malformed field names are reported
+  PASS limits above the hard cap are refused
 == com.yugahashimoto.andcode.core.policy.CommandInspectorTest (12 tests)
   PASS a compound command is inspected segment by segment
   PASS a download piped into a shell is refused
@@ -117,8 +151,8 @@ $ java -cp out RunnerKt /tmp/out
   PASS the full happy path is allowed
 == org.junit.Test (0 tests)
 
-RESULT passed=89 failed=0
+RESULT passed=120 failed=0
 run exit=0
 
 # Style checks the sandbox could not run through Gradle: line length / trailing whitespace / final newline
-files checked=21 issues=0
+files checked=26 issues=0
