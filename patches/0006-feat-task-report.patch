@@ -1,0 +1,424 @@
+From a819de08b107b5d4e66d52fe32cb6cfec118e5c1 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 26 Oct 2026 03:52:39 +0000
+Subject: [PATCH] feat(task): build the end-of-task report with a verdict that
+ cannot be talked up
+
+Sixth slice: the report the task document requires at the end of every task,
+and the separation between "the state machine got here" and "and this is what
+that proves".
+
+core/task/TaskReport.kt:
+- TaskVerdict is VERIFIED only when the task finished AND every required check
+  ran and passed. Finished-looking states without checks are NOT_VERIFIED, a
+  failed step or check is FAILED, and a declined or refused task is CANCELLED.
+  Each of those adds a ReportCaveat that the report renders under
+  "not verified", so "no checks were run" can never be shown as success.
+- TaskReport carries request, per-step records (state, paths, failure,
+  attempts), checks with their classification and one-line evidence, the policy
+  decisions from the audit log, recorded memory fact ids, limitations,
+  needsNewApk and duration - all observed facts, no prose from a model.
+- render() is a convenience text view for a PR body or a bug report.
+- TaskStep gains `failure`, so a failed step explains itself in the trail.
+
+Tests: TaskReportBuilderTest (13), including that every success state counts
+only with green checks and that an environment-blocked check is not reported as
+broken code.
+---
+ .../andcode/core/task/TaskProgress.kt         |   2 +
+ .../andcode/core/task/TaskReport.kt           | 222 ++++++++++++++++++
+ .../core/task/TaskReportBuilderTest.kt        | 140 +++++++++++
+ 3 files changed, 364 insertions(+)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt
+
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt
+index b1ee0fc..3dd5840 100644
+--- a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgress.kt
+@@ -23,6 +23,8 @@ data class TaskStep(
+     val attempts: Int = 0,
+     val startedAtMs: Long? = null,
+     val finishedAtMs: Long? = null,
++    /** Why it failed, when it did; the runner stores a redacted message, never a raw log. */
++    val failure: String? = null,
+ ) {
+     /** Started and never finished: the process died, or the step is still in flight. */
+     val isInFlight: Boolean get() = state == StepState.RUNNING
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt
+new file mode 100644
+index 0000000..2c7d9e9
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt
+@@ -0,0 +1,222 @@
++package com.yugahashimoto.andcode.core.task
++
++import com.yugahashimoto.andcode.core.buildcheck.CheckResult
++import com.yugahashimoto.andcode.core.buildcheck.FailureClass
++import com.yugahashimoto.andcode.core.policy.PolicyAuditEntry
++
++/** What actually happened to one step, as recorded for the report. */
++data class StepRecord(
++    val stepId: String,
++    val title: String,
++    val state: StepState,
++    /** Paths the step said it would touch, if any. */
++    val paths: List<String> = emptyList(),
++    /** Reason a failed step gave, already redacted by the policy layer. */
++    val failure: String? = null,
++    val attempts: Int = 0,
++)
++
++/**
++ * The verdict, which is not the same thing as the state.
++ *
++ * [VERIFIED] is the only value that means "the required checks ran and passed". A task that reached a
++ * success-looking state without running its checks is [NOT_VERIFIED], and the report says why - this is the
++ * rule from the task's rules: never show "completed successfully" when an acceptance condition failed or a
++ * required test did not run.
++ */
++enum class TaskVerdict {
++    /** Finished and every required check ran green. */
++    VERIFIED,
++
++    /** Finished, but something is missing or unproven: no checks, or checks that were not run. */
++    NOT_VERIFIED,
++
++    /** A step or a check failed. */
++    FAILED,
++
++    /** The user cancelled, or the task was refused by policy. */
++    CANCELLED,
++}
++
++/** Why a verdict is not [TaskVerdict.VERIFIED]. Shown to the user, so it has to be specific. */
++enum class ReportCaveat {
++    NO_CHECKS_RUN,
++    CHECK_FAILED,
++    CHECK_NOT_RUN_FOR_FAILURE_CLASS,
++    STEP_FAILED,
++    CANCELLED_BY_USER,
++    REFUSED_BY_POLICY,
++    TIME_BUDGET_EXHAUSTED,
++    RETRY_BUDGET_EXHAUSTED,
++    TASK_NOT_FINISHED,
++}
++
++/**
++ * The end-of-task report the task document requires (section 4.4): request, plan, files, checks and their
++ * results, what failed, the risk decisions taken, whether a new APK is needed, and what was not verified.
++ *
++ * Built by [TaskReportBuilder] from facts the runner already produced. It is data, not prose: every field is
++ * something the app observed, and [render] is a convenience view, not the source of truth.
++ */
++data class TaskReport(
++    val taskId: String,
++    val request: String,
++    val state: TaskState,
++    val verdict: TaskVerdict,
++    val steps: List<StepRecord>,
++    val checks: List<CheckResult>,
++    val policyDecisions: List<PolicyAuditEntry>,
++    val memoryFactIds: List<String>,
++    val caveats: List<ReportCaveat>,
++    val limitations: List<String>,
++    /** True when the work cannot take effect without installing a new build. */
++    val needsNewApk: Boolean,
++    val durationMs: Long,
++) {
++    val changedPaths: List<String> get() = steps.flatMap { it.paths }.distinct().sorted()
++
++    val failedChecks: List<CheckResult> get() = checks.filterNot { it.passed }
++
++    /** One line per caveat, in the order they were found. */
++    fun caveatLines(): List<String> =
++        caveats.map { caveat ->
++            when (caveat) {
++                ReportCaveat.NO_CHECKS_RUN -> "no checks were run, so nothing is proven about this change"
++                ReportCaveat.CHECK_FAILED -> "a required check failed"
++                ReportCaveat.CHECK_NOT_RUN_FOR_FAILURE_CLASS -> "a check could not run in this environment"
++                ReportCaveat.STEP_FAILED -> "a step failed"
++                ReportCaveat.CANCELLED_BY_USER -> "the user cancelled the task"
++                ReportCaveat.REFUSED_BY_POLICY -> "the policy engine refused part of the plan"
++                ReportCaveat.TIME_BUDGET_EXHAUSTED -> "the time budget ran out"
++                ReportCaveat.RETRY_BUDGET_EXHAUSTED -> "the retry budget ran out"
++                ReportCaveat.TASK_NOT_FINISHED -> "the task has not reached a verified state"
++            }
++        }
++
++    /** Plain-text rendering for a bug report, a PR body or the task screen's export action. */
++    fun render(): String =
++        buildString {
++            appendLine("task ${taskId}: ${state.name} / ${verdict.name}")
++            appendLine("request: $request")
++            appendLine("duration: ${durationMs}ms, new apk needed: ${if (needsNewApk) "yes" else "no"}")
++            appendLine("steps:")
++            steps.forEach { step ->
++                appendLine("  - ${step.stepId} [${step.state.name}] ${step.title}")
++                if (step.failure != null) appendLine("      failure: ${step.failure}")
++            }
++            appendLine("changed paths: ${if (changedPaths.isEmpty()) "none" else changedPaths.joinToString(", ")}")
++            appendLine("checks:")
++            if (checks.isEmpty()) appendLine("  - none")
++            checks.forEach { check ->
++                val outcome =
++                    when {
++                        check.passed -> "PASS"
++                        check.timedOut -> "TIMEOUT"
++                        else -> "${check.failure.name} exit=${check.exitCode}"
++                    }
++                appendLine("  - ${check.command.display}: $outcome")
++                check.failureEvidence?.let { appendLine("      $it") }
++            }
++            appendLine("policy decisions: ${if (policyDecisions.isEmpty()) "none" else policyDecisions.size.toString()}")
++            policyDecisions.forEach { appendLine("  - ${it.level.name}/${it.decision.name} ${it.codes.joinToString(",")}") }
++            if (memoryFactIds.isNotEmpty()) appendLine("memory facts recorded: ${memoryFactIds.joinToString(", ")}")
++            if (caveatLines().isNotEmpty()) {
++                appendLine("not verified:")
++                caveatLines().forEach { appendLine("  - $it") }
++            }
++            if (limitations.isNotEmpty()) {
++                appendLine("limitations:")
++                limitations.forEach { appendLine("  - $it") }
++            }
++        }.trimEnd()
++}
++
++/** Everything the report is built from. The runner fills this in as it goes. */
++data class TaskReportInput(
++    val taskId: String,
++    val request: String,
++    val state: TaskState,
++    val steps: List<StepRecord>,
++    val checks: List<CheckResult>,
++    val policyDecisions: List<PolicyAuditEntry> = emptyList(),
++    val memoryFactIds: List<String> = emptyList(),
++    /** The plan touched Kotlin, Gradle, the manifest or something the runner could not classify. */
++    val coreChange: Boolean = false,
++    /** Reasons a step or check could not run at all - missing toolchain, no device, and so on. */
++    val limitations: List<String> = emptyList(),
++    val cancelledByUser: Boolean = false,
++    val refusedByPolicy: Boolean = false,
++    val timeBudgetExhausted: Boolean = false,
++    val retryBudgetExhausted: Boolean = false,
++    val durationMs: Long = 0,
++)
++
++/**
++ * Turns the runner's notes into a [TaskReport] with a verdict that cannot be talked up.
++ *
++ * The rules, in order, and they are deliberately pessimistic:
++ * 1. cancelled or refused → `CANCELLED`;
++ * 2. any failed step or failed check → `FAILED`;
++ * 3. no checks at all → `NOT_VERIFIED` (with `NO_CHECKS_RUN`);
++ * 4. a check that never ran because the environment could not run it → `NOT_VERIFIED`;
++ * 5. a state that is not one of the success states → `NOT_VERIFIED`;
++ * 6. only then → `VERIFIED`.
++ */
++object TaskReportBuilder {
++    private val VERIFIED_STATES =
++        setOf(
++            TaskState.CHECKS_PASSED,
++            TaskState.READY_FOR_REVIEW,
++            TaskState.READY_TO_SHIP,
++            TaskState.SHIPPED,
++        )
++
++    fun build(input: TaskReportInput): TaskReport {
++        val caveats = mutableListOf<ReportCaveat>()
++        if (input.cancelledByUser) caveats += ReportCaveat.CANCELLED_BY_USER
++        if (input.refusedByPolicy) caveats += ReportCaveat.REFUSED_BY_POLICY
++        if (input.timeBudgetExhausted) caveats += ReportCaveat.TIME_BUDGET_EXHAUSTED
++        if (input.retryBudgetExhausted) caveats += ReportCaveat.RETRY_BUDGET_EXHAUSTED
++        if (input.steps.any { it.state == StepState.FAILED }) caveats += ReportCaveat.STEP_FAILED
++        if (input.checks.any { !it.passed }) caveats += ReportCaveat.CHECK_FAILED
++        if (input.checks.isEmpty() && input.state != TaskState.CANCELLED) caveats += ReportCaveat.NO_CHECKS_RUN
++        if (input.checks.any { !it.passed && it.failure == FailureClass.ENVIRONMENT }) {
++            caveats += ReportCaveat.CHECK_NOT_RUN_FOR_FAILURE_CLASS
++        }
++        if (input.state == TaskState.CANCELLED && input.checks.isEmpty()) {
++            caveats -= ReportCaveat.NO_CHECKS_RUN
++        }
++
++        val verdict = decide(input, caveats)
++        if (verdict == TaskVerdict.NOT_VERIFIED && ReportCaveat.TASK_NOT_FINISHED !in caveats) {
++            caveats += ReportCaveat.TASK_NOT_FINISHED
++        }
++        return TaskReport(
++            taskId = input.taskId,
++            request = input.request,
++            state = input.state,
++            verdict = verdict,
++            steps = input.steps,
++            checks = input.checks,
++            policyDecisions = input.policyDecisions,
++            memoryFactIds = input.memoryFactIds,
++            caveats = caveats.distinct(),
++            limitations = input.limitations,
++            needsNewApk = input.coreChange,
++            durationMs = input.durationMs,
++        )
++    }
++
++    private fun decide(
++        input: TaskReportInput,
++        caveats: List<ReportCaveat>,
++    ): TaskVerdict =
++        when {
++            ReportCaveat.CANCELLED_BY_USER in caveats || ReportCaveat.REFUSED_BY_POLICY in caveats -> TaskVerdict.CANCELLED
++            ReportCaveat.STEP_FAILED in caveats || ReportCaveat.CHECK_FAILED in caveats -> TaskVerdict.FAILED
++            ReportCaveat.NO_CHECKS_RUN in caveats -> TaskVerdict.NOT_VERIFIED
++            ReportCaveat.CHECK_NOT_RUN_FOR_FAILURE_CLASS in caveats -> TaskVerdict.NOT_VERIFIED
++            input.state !in VERIFIED_STATES -> TaskVerdict.NOT_VERIFIED
++            else -> TaskVerdict.VERIFIED
++        }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt
+new file mode 100644
+index 0000000..c00739f
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt
+@@ -0,0 +1,140 @@
++package com.yugahashimoto.andcode.core.task
++
++import com.yugahashimoto.andcode.core.buildcheck.CheckCategory
++import com.yugahashimoto.andcode.core.buildcheck.CheckCommand
++import com.yugahashimoto.andcode.core.buildcheck.FailureClass
++import com.yugahashimoto.andcode.core.buildcheck.FailureClassifier
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class TaskReportBuilderTest {
++    private val command = CheckCommand("test", "./gradlew", listOf("test"), CheckCategory.UNIT_TEST)
++    private val passing = FailureClassifier.result(command, 0, false, "BUILD SUCCESSFUL")
++    private val failing = FailureClassifier.result(command, 1, false, "There were failing tests.")
++    private val blocked = FailureClassifier.result(command, 1, false, "SDK location not found. Define ANDROID_HOME")
++
++    private fun input(
++        state: TaskState = TaskState.CHECKS_PASSED,
++        steps: List<StepRecord> = listOf(StepRecord("edit", "edit A.kt", StepState.DONE)),
++        checks: List<com.yugahashimoto.andcode.core.buildcheck.CheckResult> = listOf(passing),
++        cancelled: Boolean = false,
++        refused: Boolean = false,
++    ) = TaskReportInput(
++        taskId = "t1",
++        request = "add a helper",
++        state = state,
++        steps = steps,
++        checks = checks,
++        cancelledByUser = cancelled,
++        refusedByPolicy = refused,
++        durationMs = 1_500,
++    )
++
++    @Test
++    fun `green checks in a success state are verified`() {
++        assertEquals(TaskVerdict.VERIFIED, TaskReportBuilder.build(input()).verdict)
++    }
++
++    @Test
++    fun `each success-looking state counts only with green checks`() {
++        for (state in listOf(TaskState.CHECKS_PASSED, TaskState.READY_FOR_REVIEW, TaskState.READY_TO_SHIP, TaskState.SHIPPED)) {
++            assertEquals("$state", TaskVerdict.VERIFIED, TaskReportBuilder.build(input(state = state)).verdict)
++            val withoutChecks = TaskReportBuilder.build(input(state = state, checks = emptyList()))
++            assertEquals("$state without checks", TaskVerdict.NOT_VERIFIED, withoutChecks.verdict)
++        }
++    }
++
++    @Test
++    fun `a state short of the success states is not verified even with green checks`() {
++        assertEquals(TaskVerdict.NOT_VERIFIED, TaskReportBuilder.build(input(state = TaskState.RUNNING)).verdict)
++        assertEquals(TaskVerdict.NOT_VERIFIED, TaskReportBuilder.build(input(state = TaskState.AWAITING_APPROVAL)).verdict)
++    }
++
++    @Test
++    fun `no checks means not verified, with a caveat that says so`() {
++        val report = TaskReportBuilder.build(input(checks = emptyList()))
++        assertEquals(TaskVerdict.NOT_VERIFIED, report.verdict)
++        assertTrue(report.caveats.contains(ReportCaveat.NO_CHECKS_RUN))
++        assertTrue(report.caveatLines().any { it.contains("no checks were run") })
++    }
++
++    @Test
++    fun `a failed step is a failure even if the checks passed`() {
++        val steps = listOf(StepRecord("edit", "edit A.kt", StepState.FAILED, failure = "compile broke"))
++        val report = TaskReportBuilder.build(input(steps = steps))
++        assertEquals(TaskVerdict.FAILED, report.verdict)
++        assertTrue(report.caveats.contains(ReportCaveat.STEP_FAILED))
++    }
++
++    @Test
++    fun `a failed check is a failure and names the check`() {
++        val report = TaskReportBuilder.build(input(state = TaskState.FAILED, checks = listOf(passing, failing)))
++        assertEquals(TaskVerdict.FAILED, report.verdict)
++        assertEquals(1, report.failedChecks.size)
++        assertEquals(FailureClass.TEST, report.failedChecks.single().failure)
++        assertTrue(report.render().contains("FAIL"))
++    }
++
++    @Test
++    fun `a check the environment could not run is not called broken code`() {
++        val report = TaskReportBuilder.build(input(state = TaskState.FAILED, checks = listOf(blocked)))
++        assertTrue(report.caveats.contains(ReportCaveat.CHECK_NOT_RUN_FOR_FAILURE_CLASS))
++        assertTrue(report.caveatLines().any { it.contains("could not run in this environment") })
++    }
++
++    @Test
++    fun `cancellation wins over everything else`() {
++        val report = TaskReportBuilder.build(input(state = TaskState.CANCELLED, cancelled = true, checks = emptyList()))
++        assertEquals(TaskVerdict.CANCELLED, report.verdict)
++        assertTrue(report.caveats.contains(ReportCaveat.CANCELLED_BY_USER))
++        assertFalse(report.caveats.contains(ReportCaveat.NO_CHECKS_RUN))
++    }
++
++    @Test
++    fun `a policy refusal is reported as cancelled with the policy caveat`() {
++        val report = TaskReportBuilder.build(input(state = TaskState.FAILED, refused = true))
++        assertEquals(TaskVerdict.CANCELLED, report.verdict)
++        assertTrue(report.caveats.contains(ReportCaveat.REFUSED_BY_POLICY))
++    }
++
++    @Test
++    fun `changed paths are deduplicated and sorted`() {
++        val steps =
++            listOf(
++                StepRecord("a", "a", StepState.DONE, paths = listOf("/workspace/b.kt", "/workspace/a.kt")),
++                StepRecord("b", "b", StepState.DONE, paths = listOf("/workspace/a.kt")),
++            )
++        val report = TaskReportBuilder.build(input(steps = steps))
++        assertEquals(listOf("/workspace/a.kt", "/workspace/b.kt"), report.changedPaths)
++    }
++
++    @Test
++    fun `the render is a complete, readable report`() {
++        val report =
++            TaskReportBuilder.build(
++                input().copy(memoryFactIds = listOf("modules.chat"), limitations = listOf("no emulator available")),
++            )
++        val text = report.render()
++        assertTrue(text.startsWith("task t1: CHECKS_PASSED / VERIFIED"))
++        assertTrue(text.contains("request: add a helper"))
++        assertTrue(text.contains("duration: 1500ms"))
++        assertTrue(text.contains("memory facts recorded: modules.chat"))
++        assertTrue(text.contains("limitations:"))
++        assertTrue(text.contains("no emulator available"))
++    }
++
++    @Test
++    fun `a report with a caveat renders the not-verified section`() {
++        val text = TaskReportBuilder.build(input(checks = emptyList())).render()
++        assertTrue(text.contains("not verified:"))
++        assertTrue(text.contains("nothing is proven"))
++    }
++
++    @Test
++    fun `needs new apk follows the caller's classification`() {
++        assertTrue(TaskReportBuilder.build(input().copy(coreChange = true)).needsNewApk)
++        assertFalse(TaskReportBuilder.build(input()).needsNewApk)
++    }
++}
+-- 
+2.39.5
+

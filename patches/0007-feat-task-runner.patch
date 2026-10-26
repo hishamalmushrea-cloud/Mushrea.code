@@ -1,0 +1,914 @@
+From e05938c99e3d44d9dc3ee5563a56663c92deb089 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 26 Oct 2026 03:52:39 +0000
+Subject: [PATCH] feat(task): add a runner that drives plan, policy, checks and
+ report
+
+Seventh slice, and the one that puts the earlier pieces to work: TaskRunner is
+the first code that actually calls RiskEngine, TaskStateMachine, TaskResume,
+FailureClassifier and TaskReportBuilder in one flow.
+
+- The order is the one the task document asks for: plan -> assess every step
+  with the policy engine -> ask once (worst level + all reasons) when anything
+  needs approval -> execute with retries bounded by TaskLimits -> verify with the
+  declared checks -> report.
+- A DENY stops the task before anything runs and is reported as
+  REFUSED_BY_POLICY; declining the approval cancels it with nothing executed. A
+  permissive PolicyConfig still cannot auto-approve a denial.
+- Resuming goes through TaskResume: an interrupted side-effecting step is asked
+  about ("it may already have taken effect") and never silently repeated, the
+  attempt budget is spent, and the wall clock is not reset. A terminal task is
+  refused with a stated reason.
+- Limits are enforced here, not by the caller: attempts per step, wall clock
+  checked before each step, and every step assessment is written to the audit
+  log with its actor.
+- TaskPorts (approve / execute / runCheck) is the whole outside world, so the
+  orchestration is unit tested with fakes and core stays free of android.*.
+
+Errors found by running the tests, and fixed: an empty plan reached verification
+and came back VERIFIED; a retry budget that ran out was reported as a plain
+failure instead of a retry exhaustion; and the environment limitation pasted the
+raw log line instead of saying the check never ran.
+
+Tests: TaskRunnerTest (18).
+---
+ README.md                                     |   1 +
+ .../andcode/core/task/TaskRunner.kt           | 463 ++++++++++++++++++
+ .../andcode/core/task/TaskRunnerTest.kt       | 294 +++++++++++
+ docs/TASK_LIFECYCLE.md                        |  81 +++
+ 4 files changed, 839 insertions(+)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/task/TaskRunner.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/task/TaskRunnerTest.kt
+ create mode 100644 docs/TASK_LIFECYCLE.md
+
+diff --git a/README.md b/README.md
+index 93ac9e9..656a126 100644
+--- a/README.md
++++ b/README.md
+@@ -257,6 +257,7 @@ adb install -r app/build/outputs/apk/github/debug/app-github-debug.apk
+ - [Capability System](docs/CAPABILITY_SYSTEM.md)
+ - [Project Memory](docs/PROJECT_MEMORY.md)
+ - [Project Detection & Check Planning](docs/BUILD_CHECKS.md)
++- [Task Lifecycle, Runner and Report](docs/TASK_LIFECYCLE.md)
+ 
+ ## Contributing
+ 
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskRunner.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskRunner.kt
+new file mode 100644
+index 0000000..d3bbaa3
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskRunner.kt
+@@ -0,0 +1,463 @@
++package com.yugahashimoto.andcode.core.task
++
++import com.yugahashimoto.andcode.core.buildcheck.CheckCommand
++import com.yugahashimoto.andcode.core.buildcheck.CheckResult
++import com.yugahashimoto.andcode.core.buildcheck.FailureClass
++import com.yugahashimoto.andcode.core.policy.InMemoryPolicyAuditLog
++import com.yugahashimoto.andcode.core.policy.OperationKind
++import com.yugahashimoto.andcode.core.policy.PolicyConfig
++import com.yugahashimoto.andcode.core.policy.PolicyDecision
++import com.yugahashimoto.andcode.core.policy.PolicyOperation
++import com.yugahashimoto.andcode.core.policy.RiskAssessment
++import com.yugahashimoto.andcode.core.policy.RiskEngine
++import com.yugahashimoto.andcode.core.policy.RiskLevel
++
++/** One step of a plan: what it says it does, and the operation the policy engine judges. */
++data class PlannedStep(
++    val id: String,
++    val title: String,
++    val operation: PolicyOperation,
++    /**
++     * Whether repeating it after an interruption is safe. Writing, deleting, pushing, releasing and running
++     * a command are all treated as unsafe to repeat, because the previous attempt may already have landed.
++     */
++    val sideEffecting: Boolean = operation.kind in DEFAULT_SIDE_EFFECTING,
++) {
++    companion object {
++        val DEFAULT_SIDE_EFFECTING =
++            setOf(
++                OperationKind.WRITE_FILE,
++                OperationKind.DELETE_FILE,
++                OperationKind.RUN_COMMAND,
++                OperationKind.VCS_PUSH,
++                OperationKind.RELEASE,
++                OperationKind.DEVICE_FLASH,
++                OperationKind.INSTALL_DEPENDENCY,
++                OperationKind.POLICY_OVERRIDE,
++            )
++    }
++}
++
++/** What happened when a step was actually attempted. */
++sealed interface StepOutcome {
++    data object Succeeded : StepOutcome
++
++    data class Failed(
++        val message: String,
++        val retryable: Boolean = false,
++    ) : StepOutcome
++}
++
++/** What the user is being asked to approve, with everything needed to decide. */
++data class ApprovalRequest(
++    val taskId: String,
++    val title: String,
++    val level: RiskLevel,
++    val reasons: List<String>,
++)
++
++/**
++ * Everything the runner needs from the outside world.
++ *
++ * Deliberately a set of functions rather than a concrete service: the orchestration stays pure and unit
++ * testable with fakes, and this is the seam where the Android implementation (real approvals, the runtime's
++ * tool calls, the terminal's process runner) plugs in without `core` depending on Android.
++ */
++interface TaskPorts {
++    /** Asks the user. Returning false means "do not run this", and the runner stops the task. */
++    fun approve(request: ApprovalRequest): Boolean
++
++    /** Runs one step. Called only after the policy engine allowed it and, if needed, the user approved. */
++    fun execute(step: PlannedStep): StepOutcome
++
++    /** Runs one bounded check command and returns its classified result. */
++    fun runCheck(command: CheckCommand): CheckResult
++}
++
++/** A task to run: the request text, the plan, and the checks that have to pass before it counts. */
++data class TaskRequest(
++    val id: String,
++    val description: String,
++    val plan: List<PlannedStep>,
++    val checks: List<CheckCommand> = emptyList(),
++    /** True when the change only fully takes effect with a new build (Kotlin, Gradle, manifest). */
++    val requiresNewApk: Boolean = false,
++)
++
++/** Result of a run: where the task ended up, the report for the user, and the risk verdicts taken. */
++data class TaskRun(
++    val progress: TaskProgress,
++    val report: TaskReport,
++    val resumed: Boolean,
++    val assessments: List<RiskAssessment>,
++)
++
++/**
++ * Drives one task through its lifecycle, and is the only thing that decides what the user is told.
++ *
++ * It uses the rules built in the earlier slices, in the order the task document asks for: assess with
++ * `core/policy` → ask if needed → execute → verify with `core/buildcheck` → report. Nothing here trusts a
++ * step's claim of success: the verdict comes from [TaskReportBuilder], which answers VERIFIED only when the
++ * required checks actually ran and passed.
++ *
++ * Limits are enforced here rather than by the caller: attempts, wall clock, and - via [TaskResume] - the
++ * rule that an interrupted side-effecting step is never repeated without confirmation.
++ */
++class TaskRunner(
++    private val ports: TaskPorts,
++    private val config: PolicyConfig = PolicyConfig(),
++    private val limits: TaskLimits = TaskLimits(),
++    private val audit: InMemoryPolicyAuditLog = InMemoryPolicyAuditLog(),
++    private val clock: () -> Long = { System.currentTimeMillis() },
++) {
++    fun run(
++        request: TaskRequest,
++        previous: TaskProgress? = null,
++    ): TaskRun {
++        val startedAt = clock()
++        val resumed = previous != null
++        if (previous == null) return drive(request, freshProgress(request, startedAt), startedAt, resumed = false)
++
++        val progress = previous
++        val plan = TaskResume.plan(progress, startedAt, limits)
++        if (plan is ResumePlan.Blocked) {
++            return finish(
++                request = request,
++                progress = progress,
++                startedAt = startedAt,
++                resumed = true,
++                assessments = emptyList(),
++                refused = false,
++                cancelled = false,
++                limitations = listOf("cannot resume: ${plan.detail}"),
++            )
++        }
++        val confirmed = confirmSideEffects(request, progress, plan as ResumePlan.Resumable)
++        val begun = TaskResume.begin(confirmed, plan)
++        if (!begun.resumed) {
++            return finish(
++            request,
++            confirmed,
++            startedAt,
++            resumed = true,
++            assessments = emptyList(),
++            refused = false,
++            cancelled = false,
++            limitations = listOf("task is not in a resumable state"),
++        )
++        }
++        return drive(request, begun.progress, startedAt, resumed = true)
++    }
++
++    /** Plans, assesses, asks, executes and verifies - or stops at the first thing that says no. */
++    private fun drive(
++        request: TaskRequest,
++        start: TaskProgress,
++        startedAt: Long,
++        resumed: Boolean,
++    ): TaskRun {
++        if (request.plan.isEmpty()) {
++            return finish(
++                request, start, startedAt, resumed, emptyList(), refused = false, cancelled = false,
++                limitations = listOf("the plan has no steps, so there is nothing to verify"),
++            )
++        }
++        var progress = start
++        if (progress.state == TaskState.DRAFT) {
++            progress = advance(progress, TaskState.INSPECTING, TaskFacts()) ?: return unstarted(request, progress, startedAt, resumed)
++            progress = advance(progress, TaskState.PLANNED, TaskFacts()) ?: return unstarted(request, progress, startedAt, resumed)
++        }
++
++        val assessments =
++            request.plan.map { step ->
++                RiskEngine.assess(step.operation, config).also { audit.record(step.operation, it) }
++            }
++        if (assessments.any { it.decision == PolicyDecision.DENY }) {
++            return finish(request, progress.copy(state = TaskState.FAILED), startedAt, resumed, assessments, true, false)
++        }
++
++        if (progress.state == TaskState.PLANNED) {
++            if (assessments.any { it.requiresAttention }) {
++                progress = advance(progress, TaskState.AWAITING_APPROVAL, TaskFacts())
++                    ?: return unstarted(request, progress, startedAt, resumed)
++                if (!ports.approve(approvalFor(request, assessments))) {
++                    return finish(request, progress.copy(state = TaskState.CANCELLED), startedAt, resumed, assessments, false, true)
++                }
++            }
++            progress = advance(progress, TaskState.READY, TaskFacts(approved = true))
++                ?: return unstarted(request, progress, startedAt, resumed)
++            progress = advance(progress, TaskState.RUNNING, TaskFacts(approved = true))
++                ?: return unstarted(request, progress, startedAt, resumed)
++        }
++        if (progress.state != TaskState.RUNNING) return unstarted(request, progress, startedAt, resumed)
++
++        val executed = executeSteps(request, progress, startedAt, resumed, assessments)
++        if (executed.terminal != null) return executed.terminal
++        return verify(request, executed.progress, startedAt, resumed, assessments)
++    }
++
++    private data class ExecutionStage(
++        val progress: TaskProgress,
++        val terminal: TaskRun?,
++    )
++
++    private fun executeSteps(
++        request: TaskRequest,
++        start: TaskProgress,
++        startedAt: Long,
++        resumed: Boolean,
++        assessments: List<RiskAssessment>,
++    ): ExecutionStage {
++        var progress = start
++        var attempts = progress.attempts
++        for (step in request.plan) {
++            val current = progress.steps.firstOrNull { it.id == step.id }
++            if (current == null || current.state == StepState.DONE || current.state == StepState.SKIPPED) continue
++            if (clock() - progress.startedAtMs > limits.maxWallClockMs) {
++                val expired = failedProgress(progress, step.id, "wall clock budget exhausted")
++                val terminal =
++                    finish(
++                        request,
++                        expired,
++                        startedAt,
++                        resumed,
++                        assessments,
++                        refused = false,
++                        cancelled = false,
++                        timeExhausted = true,
++                    )
++                return ExecutionStage(expired, terminal)
++            }
++            val outcome = attempt(step, progress, budget = limits.maxAttempts)
++            attempts += outcome.attemptsUsed
++            progress = outcome.progress.copy(attempts = attempts)
++            if (outcome.failure != null) {
++                val state = progress.copy(state = TaskState.FAILED)
++                return ExecutionStage(
++                    state,
++                    finish(
++                        request,
++                        state,
++                        startedAt,
++                        resumed,
++                        assessments,
++                        refused = false,
++                        cancelled = false,
++                        retryExhausted = outcome.failure.retryable,
++                    ),
++                )
++            }
++        }
++        return ExecutionStage(progress, null)
++    }
++
++    private data class AttemptResult(
++        val progress: TaskProgress,
++        val failure: StepOutcome.Failed?,
++        val attemptsUsed: Int,
++    )
++
++    /** Executes one step until it succeeds, fails for good, or the retry budget is gone. */
++    private fun attempt(
++        step: PlannedStep,
++        start: TaskProgress,
++        budget: Int,
++    ): AttemptResult {
++        var progress = start
++        var spent = 0
++        while (spent < budget) {
++            spent++
++            progress =
++                progress.withStep(
++                    progress.step(step.id).copy(state = StepState.RUNNING, attempts = spent, startedAtMs = clock(), failure = null),
++                )
++            when (val outcome = ports.execute(step)) {
++                is StepOutcome.Succeeded -> {
++                    progress = progress.withStep(progress.step(step.id).copy(state = StepState.DONE, finishedAtMs = clock()))
++                    return AttemptResult(progress, null, spent)
++                }
++                is StepOutcome.Failed -> {
++                    progress = progress.withStep(
++                        progress.step(step.id).copy(state = StepState.FAILED, failure = outcome.message, finishedAtMs = clock()),
++                    )
++                    if (!outcome.retryable) return AttemptResult(progress, outcome, spent)
++                }
++            }
++        }
++        // Every attempt exhausted the budget, so the run is reported as a retry exhaustion rather than as a
++        // plain failure: a retry *could* have helped, we simply were not allowed another one.
++        return AttemptResult(progress, StepOutcome.Failed("retry budget exhausted", retryable = true), spent)
++    }
++
++    private fun verify(
++        request: TaskRequest,
++        start: TaskProgress,
++        startedAt: Long,
++        resumed: Boolean,
++        assessments: List<RiskAssessment>,
++    ): TaskRun {
++        val verifying = advance(start, TaskState.VERIFYING, TaskFacts(approved = true))
++            ?: return unstarted(request, start, startedAt, resumed)
++        val results = request.checks.map { ports.runCheck(it) }
++        val green = results.isNotEmpty() && results.all { it.passed }
++        val facts = TaskFacts(approved = true, checksGreen = green)
++        val next =
++            advance(verifying, if (green) TaskState.CHECKS_PASSED else TaskState.FAILED, facts)
++                ?: verifying.copy(state = TaskState.FAILED)
++        val limitations =
++            results
++                .filter { !it.passed && it.failure == FailureClass.ENVIRONMENT }
++                .map { "${it.command.display} could not run in this environment: ${it.failureEvidence ?: "no detail"}" }
++        return finish(
++            request = request,
++            progress = next,
++            startedAt = startedAt,
++            resumed = resumed,
++            assessments = assessments,
++            refused = false,
++            cancelled = false,
++            limitations = limitations,
++            checkResults = results,
++        )
++    }
++
++    /**
++     * Asks about every interrupted side-effecting step. Confirming means "it did not land, run it again";
++     * declining means "assume it landed", and the step is skipped instead of repeated.
++     */
++    private fun confirmSideEffects(
++        request: TaskRequest,
++        progress: TaskProgress,
++        plan: ResumePlan.Resumable,
++    ): TaskProgress {
++        var current = progress
++        for (stepId in plan.stepsNeedingConfirmation) {
++            val approved =
++                ports.approve(
++                    ApprovalRequest(
++                        taskId = request.id,
++                        title = "step '$stepId' was running when the task stopped",
++                        level = RiskLevel.HIGH,
++                        reasons = listOf("it may already have taken effect; confirm before it runs again"),
++                    ),
++                )
++            current = if (approved) TaskResume.confirmSideEffect(current, stepId) else TaskResume.abandonSideEffect(current, stepId)
++        }
++        return current
++    }
++
++    private fun TaskProgress.step(id: String): TaskStep = steps.first { it.id == id }
++
++    private fun advance(
++        progress: TaskProgress,
++        to: TaskState,
++        facts: TaskFacts,
++    ): TaskProgress? =
++        if (TaskStateMachine.transition(progress.state, to, facts) is TransitionResult.Allowed) {
++            progress.copy(state = to)
++        } else {
++            null
++        }
++
++    private fun approvalFor(
++        request: TaskRequest,
++        assessments: List<RiskAssessment>,
++    ): ApprovalRequest {
++        val worst = RiskLevel.worstOf(assessments.map { it.level })
++        val reasons =
++            request.plan.zip(assessments)
++                .flatMap { (step, assessment) -> assessment.reasons.map { "${step.id}: ${it.code.name} - ${it.detail}" } }
++                .distinct()
++                .take(MAX_APPROVAL_REASONS)
++        return ApprovalRequest(request.id, request.description, worst, reasons)
++    }
++
++    private fun freshProgress(
++        request: TaskRequest,
++        startedAt: Long,
++    ): TaskProgress =
++        TaskProgress(
++            state = TaskState.DRAFT,
++            steps = request.plan.map { TaskStep(it.id, sideEffecting = it.sideEffecting) },
++            startedAtMs = startedAt,
++        )
++
++    private fun failedProgress(
++        progress: TaskProgress,
++        stepId: String,
++        message: String,
++    ): TaskProgress {
++        val step = progress.steps.firstOrNull { it.id == stepId } ?: return progress
++        return progress.copy(
++            state = TaskState.FAILED,
++            steps = progress.steps.map { if (it.id == stepId) step.copy(state = StepState.FAILED, failure = message) else it },
++        )
++    }
++
++    /** The state machine refused a transition. Reported instead of thrown, so the user sees it. */
++    private fun unstarted(
++        request: TaskRequest,
++        progress: TaskProgress,
++        startedAt: Long,
++        resumed: Boolean,
++    ) = finish(
++        request = request,
++        progress = progress,
++        startedAt = startedAt,
++        resumed = resumed,
++        assessments = emptyList(),
++        refused = false,
++        cancelled = false,
++        limitations = listOf("the task could not move out of ${progress.state.name}"),
++    )
++
++    private fun finish(
++        request: TaskRequest,
++        progress: TaskProgress,
++        startedAt: Long,
++        resumed: Boolean,
++        assessments: List<RiskAssessment>,
++        refused: Boolean,
++        cancelled: Boolean,
++        limitations: List<String> = emptyList(),
++        checkResults: List<CheckResult> = emptyList(),
++        timeExhausted: Boolean = false,
++        retryExhausted: Boolean = false,
++    ): TaskRun {
++        val records =
++            request.plan.map { step ->
++                val state = progress.steps.firstOrNull { it.id == step.id }
++                StepRecord(
++                    stepId = step.id,
++                    title = step.title,
++                    state = state?.state ?: StepState.PENDING,
++                    paths = step.operation.paths,
++                    failure = state?.failure,
++                    attempts = state?.attempts ?: 0,
++                )
++            }
++        val report =
++            TaskReportBuilder.build(
++                TaskReportInput(
++                    taskId = request.id,
++                    request = request.description,
++                    state = progress.state,
++                    steps = records,
++                    checks = checkResults,
++                    policyDecisions = audit.snapshot(),
++                    coreChange = request.requiresNewApk,
++                    limitations = limitations,
++                    cancelledByUser = cancelled,
++                    refusedByPolicy = refused,
++                    timeBudgetExhausted = timeExhausted,
++                    retryBudgetExhausted = retryExhausted,
++                    durationMs = clock() - startedAt,
++                ),
++            )
++        return TaskRun(progress, report, resumed, assessments)
++    }
++
++    private companion object {
++        const val MAX_APPROVAL_REASONS = 8
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskRunnerTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskRunnerTest.kt
+new file mode 100644
+index 0000000..e1fe5b1
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskRunnerTest.kt
+@@ -0,0 +1,294 @@
++package com.yugahashimoto.andcode.core.task
++
++import com.yugahashimoto.andcode.core.buildcheck.CheckCategory
++import com.yugahashimoto.andcode.core.buildcheck.CheckCommand
++import com.yugahashimoto.andcode.core.buildcheck.CheckResult
++import com.yugahashimoto.andcode.core.buildcheck.FailureClass
++import com.yugahashimoto.andcode.core.buildcheck.FailureClassifier
++import com.yugahashimoto.andcode.core.policy.OperationKind
++import com.yugahashimoto.andcode.core.policy.InMemoryPolicyAuditLog
++import com.yugahashimoto.andcode.core.policy.PolicyConfig
++import com.yugahashimoto.andcode.core.policy.PolicyOperation
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class TaskRunnerTest {
++    private var now = 1_000_000L
++    private val clock = { now }
++
++    private val unitTest =
++        CheckCommand("test", "./gradlew", listOf("test"), CheckCategory.UNIT_TEST)
++
++    private fun readStep(id: String = "read", path: String = "/workspace/app/A.kt") =
++        PlannedStep(id, "read A.kt", PolicyOperation(tool = "read", kind = OperationKind.READ_FILE, paths = listOf(path)))
++
++    private fun editStep(id: String = "edit") =
++        PlannedStep(
++            id,
++            "edit A.kt",
++            PolicyOperation(tool = "edit", kind = OperationKind.WRITE_FILE, paths = listOf("/workspace/app/A.kt")),
++        )
++
++    private fun shellStep(id: String = "shell", command: String = "./gradlew test") =
++        PlannedStep(id, "run $command", PolicyOperation(tool = "bash", kind = OperationKind.RUN_COMMAND, command = command))
++
++    /** Records what the runner asked, so tests can assert on the conversation with the user. */
++    private class FakePorts(
++        private val approval: Boolean = true,
++        private val outcomes: List<StepOutcome> = emptyList(),
++        private val checkResult: (CheckCommand) -> CheckResult = { command ->
++            FailureClassifier.result(command, 0, false, "BUILD SUCCESSFUL")
++        },
++    ) : TaskPorts {
++        val approvals = mutableListOf<ApprovalRequest>()
++        val executed = mutableListOf<String>()
++        private var outcomeIndex = 0
++
++        override fun approve(request: ApprovalRequest): Boolean {
++            approvals += request
++            return approval
++        }
++
++        override fun execute(step: PlannedStep): StepOutcome {
++            executed += step.id
++            val outcome = outcomes.getOrNull(outcomeIndex) ?: StepOutcome.Succeeded
++            outcomeIndex++
++            return outcome
++        }
++
++        override fun runCheck(command: CheckCommand): CheckResult = checkResult(command)
++    }
++
++    @Test
++    fun `a clean plan with passing checks is verified`() {
++        val ports = FakePorts()
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "add a helper", listOf(editStep()), listOf(unitTest)))
++
++        assertEquals(TaskState.CHECKS_PASSED, run.progress.state)
++        assertEquals(TaskVerdict.VERIFIED, run.report.verdict)
++        assertEquals(listOf("edit"), ports.executed)
++        assertEquals(emptyList<Any>(), run.report.caveats)
++        assertTrue(run.report.render().contains("VERIFIED"))
++    }
++
++    @Test
++    fun `a workspace edit needs no approval but a shell command does`() {
++        val editPorts = FakePorts()
++        TaskRunner(editPorts, clock = clock).run(TaskRequest("t1", "edit", listOf(editStep()), listOf(unitTest)))
++        assertTrue(editPorts.approvals.isEmpty())
++
++        val shellPorts = FakePorts()
++        TaskRunner(shellPorts, clock = clock).run(TaskRequest("t2", "run", listOf(shellStep()), listOf(unitTest)))
++        assertEquals(1, shellPorts.approvals.size)
++        assertTrue(shellPorts.approvals.single().reasons.any { it.contains("shell") })
++    }
++
++    @Test
++    fun `refusing the approval cancels instead of running anything`() {
++        val ports = FakePorts(approval = false)
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "run", listOf(shellStep()), listOf(unitTest)))
++
++        assertEquals(TaskState.CANCELLED, run.progress.state)
++        assertEquals(TaskVerdict.CANCELLED, run.report.verdict)
++        assertTrue(ports.executed.isEmpty())
++    }
++
++    @Test
++    fun `a denied operation never executes and is reported as refused`() {
++        val ports = FakePorts()
++        val destructive = shellStep("wipe", "rm -rf /")
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "wipe", listOf(destructive), listOf(unitTest)))
++
++        assertEquals(TaskState.FAILED, run.progress.state)
++        assertEquals(TaskVerdict.CANCELLED, run.report.verdict)
++        assertTrue(run.report.caveats.contains(ReportCaveat.REFUSED_BY_POLICY))
++        assertTrue(ports.executed.isEmpty())
++        assertTrue(ports.approvals.isEmpty())
++    }
++
++    @Test
++    fun `a failing step stops the task and never claims success`() {
++        val ports = FakePorts(outcomes = listOf(StepOutcome.Failed("compile broke")))
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "edit", listOf(editStep()), listOf(unitTest)))
++
++        assertEquals(TaskState.FAILED, run.progress.state)
++        assertEquals(TaskVerdict.FAILED, run.report.verdict)
++        assertEquals("compile broke", run.report.steps.single().failure)
++    }
++
++    @Test
++    fun `a retryable failure is retried within the budget and then succeeds`() {
++        val ports = FakePorts(outcomes = listOf(StepOutcome.Failed("flaky", retryable = true), StepOutcome.Succeeded))
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "run", listOf(shellStep()), listOf(unitTest)))
++
++        assertEquals(TaskState.CHECKS_PASSED, run.progress.state)
++        assertEquals(listOf("shell", "shell"), ports.executed)
++        assertEquals(2, run.report.steps.single().attempts)
++    }
++
++    @Test
++    fun `a retry budget that runs out fails the task with the retry caveat`() {
++        val ports = FakePorts(outcomes = List(5) { StepOutcome.Failed("still flaky", retryable = true) })
++        val run = TaskRunner(ports, clock = clock, limits = TaskLimits(maxAttempts = 2)).run(
++            TaskRequest("t1", "run", listOf(shellStep()), listOf(unitTest)),
++        )
++
++        assertEquals(TaskState.FAILED, run.progress.state)
++        assertTrue(run.report.caveats.contains(ReportCaveat.RETRY_BUDGET_EXHAUSTED))
++        assertEquals(2, ports.executed.size)
++    }
++
++    @Test
++    fun `a check that fails makes the verdict FAILED even though the steps ran`() {
++        val ports =
++            FakePorts(
++                checkResult = { command -> FailureClassifier.result(command, 1, false, "There were failing tests.") },
++            )
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "edit", listOf(editStep()), listOf(unitTest)))
++
++        assertEquals(TaskState.FAILED, run.progress.state)
++        assertEquals(TaskVerdict.FAILED, run.report.verdict)
++        assertEquals(FailureClass.TEST, run.report.failedChecks.single().failure)
++    }
++
++    @Test
++    fun `a plan with no checks is never verified`() {
++        val ports = FakePorts()
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "edit", listOf(editStep()), checks = emptyList()))
++
++        assertEquals(TaskVerdict.NOT_VERIFIED, run.report.verdict)
++        assertTrue(run.report.caveats.contains(ReportCaveat.NO_CHECKS_RUN))
++    }
++
++    @Test
++    fun `a check blocked by the environment is reported as a limitation, not as broken code`() {
++        val ports =
++            FakePorts(
++                checkResult = { command ->
++                    FailureClassifier.result(command, 1, false, "SDK location not found. Define ANDROID_HOME")
++                },
++            )
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "edit", listOf(editStep()), listOf(unitTest)))
++
++        assertEquals(FailureClass.ENVIRONMENT, run.report.failedChecks.single().failure)
++        assertTrue(run.report.caveats.contains(ReportCaveat.CHECK_NOT_RUN_FOR_FAILURE_CLASS))
++        assertTrue(run.report.limitations.single().contains("could not run in this environment"))
++    }
++
++    @Test
++    fun `the wall clock budget stops the run`() {
++        val ports = FakePorts()
++        var ticks = 0
++        val slowClock = {
++            ticks++
++            now + if (ticks > 2) TaskLimits.DEFAULT_MAX_WALL_CLOCK_MS + 1 else 0
++        }
++        val run = TaskRunner(ports, clock = slowClock).run(
++            TaskRequest("t1", "edit", listOf(editStep(), editStep("edit2")), listOf(unitTest)),
++        )
++
++        assertEquals(TaskState.FAILED, run.progress.state)
++        assertTrue(run.report.caveats.contains(ReportCaveat.TIME_BUDGET_EXHAUSTED))
++    }
++
++    @Test
++    fun `the report lists changed paths, decisions and whether a new apk is needed`() {
++        val ports = FakePorts()
++        val run = TaskRunner(ports, clock = clock).run(
++            TaskRequest("t1", "edit", listOf(editStep()), listOf(unitTest), requiresNewApk = true),
++        )
++
++        assertEquals(listOf("/workspace/app/A.kt"), run.report.changedPaths)
++        assertTrue(run.report.needsNewApk)
++        assertEquals(1, run.report.policyDecisions.size)
++        assertTrue(run.report.render().contains("new apk needed: yes"))
++    }
++
++    @Test
++    fun `resuming a paused task re-runs only the open steps`() {
++        val ports = FakePorts()
++        val paused =
++            TaskProgress(
++                state = TaskState.PAUSED,
++                steps =
++                    listOf(
++                        TaskStep("edit", StepState.DONE, sideEffecting = true, finishedAtMs = now),
++                        TaskStep("edit2", StepState.PENDING, sideEffecting = true),
++                    ),
++                startedAtMs = now,
++            )
++        val run = TaskRunner(ports, clock = clock).run(
++            TaskRequest("t1", "edit", listOf(editStep("edit"), editStep("edit2")), listOf(unitTest)),
++            previous = paused,
++        )
++
++        assertTrue(run.resumed)
++        assertEquals(listOf("edit2"), ports.executed)
++        assertEquals(TaskVerdict.VERIFIED, run.report.verdict)
++    }
++
++    @Test
++    fun `resuming never silently repeats an interrupted side effect`() {
++        val ports = FakePorts(approval = false)
++        val interrupted =
++            TaskProgress(
++                state = TaskState.RUNNING,
++                steps = listOf(TaskStep("edit", StepState.RUNNING, sideEffecting = true)),
++                startedAtMs = now,
++            )
++        val run = TaskRunner(ports, clock = clock).run(
++            TaskRequest("t1", "edit", listOf(editStep("edit")), listOf(unitTest)),
++            previous = interrupted,
++        )
++
++        // The user declined, so the step is skipped rather than run again; it was asked about explicitly.
++        assertTrue(ports.approvals.single().title.contains("was running when the task stopped"))
++        assertTrue(ports.executed.isEmpty())
++        assertEquals(StepState.SKIPPED, run.progress.steps.single().state)
++    }
++
++    @Test
++    fun `a terminal task cannot be resumed`() {
++        val ports = FakePorts()
++        val shipped = TaskProgress(state = TaskState.SHIPPED, steps = listOf(TaskStep("edit")), startedAtMs = now)
++        val run = TaskRunner(ports, clock = clock).run(
++            TaskRequest("t1", "edit", listOf(editStep("edit")), listOf(unitTest)),
++            previous = shipped,
++        )
++
++        assertFalse(run.resumed && run.progress.state == TaskState.CHECKS_PASSED)
++        assertTrue(ports.executed.isEmpty())
++        assertEquals(TaskState.SHIPPED, run.progress.state)
++        assertTrue(run.report.limitations.single().startsWith("cannot resume"))
++    }
++
++    @Test
++    fun `every assessed operation is written to the audit trail`() {
++        val audit = InMemoryPolicyAuditLog()
++        val ports = FakePorts()
++        TaskRunner(ports, clock = clock, audit = audit).run(
++            TaskRequest("t1", "edit", listOf(editStep(), shellStep()), listOf(unitTest)),
++        )
++        assertEquals(2, audit.size)
++        assertTrue(audit.snapshot().all { it.actor.startsWith("agent:") })
++    }
++
++    @Test
++    fun `a permissive config still cannot auto approve a denial`() {
++        val ports = FakePorts()
++        val run = TaskRunner(ports, config = PolicyConfig.permissive(), clock = clock).run(
++            TaskRequest("t1", "wipe", listOf(shellStep("wipe", "rm -rf /")), listOf(unitTest)),
++        )
++        assertEquals(TaskVerdict.CANCELLED, run.report.verdict)
++        assertTrue(ports.executed.isEmpty())
++    }
++
++    @Test
++    fun `an empty plan is reported as not verified rather than done`() {
++        val ports = FakePorts()
++        val run = TaskRunner(ports, clock = clock).run(TaskRequest("t1", "nothing", emptyList(), listOf(unitTest)))
++        assertEquals(TaskVerdict.NOT_VERIFIED, run.report.verdict)
++    }
++}
+diff --git a/docs/TASK_LIFECYCLE.md b/docs/TASK_LIFECYCLE.md
+new file mode 100644
+index 0000000..d6b0009
+--- /dev/null
++++ b/docs/TASK_LIFECYCLE.md
+@@ -0,0 +1,81 @@
++# Task Lifecycle, Runner and Report
++
++This is the piece that ties the core together: `TaskRunner` drives one task from request to report, using
++the policy engine, the state machine, the resume rules and the check classifier that already existed.
++
++## Files
++
++| File | Responsibility |
++| --- | --- |
++| `core/task/TaskRunner.kt` | `TaskRunner`, `TaskPorts`, `PlannedStep`, `TaskRequest`, `TaskRun`, `StepOutcome`, `ApprovalRequest` |
++| `core/task/TaskReport.kt` | `StepRecord`, `TaskVerdict`, `ReportCaveat`, `TaskReport`, `TaskReportInput`, `TaskReportBuilder` |
++| `core/task/TaskState.kt`, `TaskStateMachine.kt` | States and the transitions allowed between them (unchanged) |
++| `core/task/TaskProgress.kt`, `TaskLimits.kt`, `TaskResume.kt` | Saved progress, hard stops, resume/confirm/cancel rules (unchanged) |
++
++Tests: `TaskRunnerTest` (18), `TaskReportBuilderTest` (13), `TaskStateMachineTest` (11), `TaskResumeTest` (13).
++
++## The order the runner follows
++
++```
++DRAFT → INSPECTING → PLANNED
++   assess every step with RiskEngine
++     ├─ any DENY   → FAILED, nothing runs, report says REFUSED_BY_POLICY
++     └─ any REQUIRE_APPROVAL → AWAITING_APPROVAL → ask once (worst level + all reasons)
++                                └─ declined → CANCELLED, nothing runs
++AWAITING_APPROVAL|PLANNED → READY → RUNNING
++   per step: execute, retry only if the step says the failure is retryable,
++             stop on the first hard failure, wall clock checked before each step
++RUNNING → VERIFYING
++   run the declared checks
++     ├─ all green → CHECKS_PASSED
++     └─ otherwise → FAILED
++→ TaskReport with a verdict
++```
++
++Resuming (`run(request, previous = savedProgress)`) goes through `TaskResume` first: an interrupted
++side-effecting step is asked about ("it may already have taken effect"), never silently repeated, the
++attempt budget is spent, and the wall clock is *not* reset. A terminal task is refused with a stated reason.
++
++## Ports, and why
++
++`TaskPorts` is three functions: `approve`, `execute`, `runCheck`. That is the whole outside world the runner
++needs, which is why every rule above is unit tested with fakes and no emulator. The Android implementation
++plugs in here:
++
++- `approve` → the existing approval UI (`PermissionRequest` sheet), showing `ApprovalRequest.reasons`;
++- `execute` → the runtime's tool call for that step, via `ToolCallMapper` on the way in;
++- `runCheck` → the existing terminal/runtime process runner, with `CheckCommand.timeoutMs` /
++  `maxOutputBytes` applied, feeding `FailureClassifier.result(...)`.
++
++Writing this as an interface is also what keeps `core` free of `android.*`, so the whole package still
++compiles and runs on a plain JVM.
++
++## The verdict, and why it is separate from the state
++
++`TaskState.CHECKS_PASSED` says "the machine got here". `TaskVerdict` says "and here is what that proves":
++
++| Verdict | Meaning |
++| --- | --- |
++| `VERIFIED` | finished, and every required check actually ran and passed |
++| `NOT_VERIFIED` | finished-looking, but no checks ran, a check could not run, or the task is not done |
++| `FAILED` | a step or a check failed |
++| `CANCELLED` | the user declined, or the policy engine refused the plan |
++
++The builder is deliberately pessimistic: any failed step, any failed check, an empty check list, an
++environment-blocked check, or a state short of the success states all block `VERIFIED`, and each adds a
++`ReportCaveat` the report renders in a "not verified" section. An empty plan cannot reach verification at
++all.
++
++`TaskReport` carries request, steps (with per-step attempts and failure), changed paths, checks with their
++classification and one-line evidence, the policy decisions from the audit log, recorded memory fact ids,
++limitations, `needsNewApk`, and the duration. `render()` is a convenience text view for a PR body or a bug
++report; the data is the source of truth.
++
++## What is still missing
++
++- **Persistence.** `TaskProgress` is plumbed through `run(previous = ...)`, but nothing writes it to disk yet.
++- **The UI.** No screen calls `TaskRunner` yet; the task centre, plan sheet and report view are the next
++  change, together with the settings that produce `PolicyConfig`.
++- **Real ports.** The three functions above have no Android implementation in this change, which is why the
++  runner is described here as tested, not as in use.
++- **Per-test parsing.** `CheckResult` classifies a failure; it does not list which tests failed.
+-- 
+2.39.5
+

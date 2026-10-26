@@ -37,10 +37,12 @@ Maven.
 == core.policy.RiskEngineTest               (23 tests) -> 23 PASS
 == core.policy.ToolCallMapperTest           (11 tests) -> 11 PASS
 == core.security.SecretRedactionTest        (15 tests) -> 15 PASS   (14 قائمة + 1 جديد)
+== core.task.TaskReportBuilderTest          (13 tests) -> 13 PASS
 == core.task.TaskResumeTest                 (13 tests) -> 13 PASS
+== core.task.TaskRunnerTest                 (18 tests) -> 18 PASS
 == core.task.TaskStateMachineTest           (11 tests) -> 11 PASS
 
-RESULT passed=156 failed=0
+RESULT passed=187 failed=0
 ```
 
 المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّق عليها الـ patch‑ان بـ `git am`** (لا من شجرة
@@ -70,23 +72,27 @@ RESULT passed=156 failed=0
 
 ```
 $ git clone --depth 1 https://github.com/yuga-hashimoto/and-code.git /tmp/applycheck2
-$ git am patches/0001-*.patch ... patches/0005-*.patch
+$ git am patches/0001-*.patch ... patches/0007-*.patch
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
 Applying: feat(memory): add a project memory that refuses secrets and mistrusts summaries
 Applying: feat(buildcheck): detect the project type and plan bounded, classified checks
-$ git log --oneline -6
-3943f4b feat(buildcheck): detect the project type and plan bounded, classified checks
-41eac2f feat(memory): add a project memory that refuses secrets and mistrusts summaries
-dbddf0a feat(capability): add a validated capability registry with a lifecycle
-b208799 feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
-e232014 feat(policy): add an in-app risk engine and task state machine
+Applying: feat(task): build the end-of-task report with a verdict that cannot be talked up
+Applying: feat(task): add a runner that drives plan, policy, checks and report
+$ git log --oneline -8
+77e7b13 feat(task): add a runner that drives plan, policy, checks and report
+420df9f feat(task): build the end-of-task report with a verdict that cannot be talked up
+8f6c386 feat(buildcheck): detect the project type and plan bounded, classified checks
+1738117 feat(memory): add a project memory that refuses secrets and mistrusts summaries
+8e41074 feat(capability): add a validated capability registry with a lifecycle
+3f18d39 feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+f4c8d45 feat(policy): add an in-app risk engine and task state machine
 414c780 Merge pull request #404 from yuga-hashimoto/feat/402-edit-local-workspace-files
 ```
 
-أي أن الـ patches الخمسة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، وتشغيل الاختبارات
-أعلاه جرى على هذه النسخة بالضبط (34 ملفًا فُحص تنسيقيًا: لا سطر > 140، لا مسافات زائدة).
+أي أن الـ patches السبعة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، وتشغيل الاختبارات
+أعلاه جرى على هذه النسخة بالضبط (38 ملفًا فُحص تنسيقيًا: لا سطر > 140، لا مسافات زائدة).
 
 ## ما لم يُشغَّل (وهذا مذكور كقيد، لا كنجاح)
 
