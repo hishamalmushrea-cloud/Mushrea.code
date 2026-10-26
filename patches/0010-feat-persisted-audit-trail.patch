@@ -1,0 +1,649 @@
+From 2da31e5257041dc8f0cc5d93c4666292357e0336 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 26 Oct 2026 04:12:16 +0000
+Subject: [PATCH] feat(policy): save the audit trail in a versioned,
+ append-friendly file format
+
+Tenth slice: a DENY that is forgotten when the process dies is not an audit
+trail. The in-memory log stays the source of truth while the app runs;
+core/policy/PolicyAuditFile is only the format storage writes at the end of a
+session and reads at the start of the next one.
+
+```
+andcode-audit 1
+1700000000000|agent:write_file|MEDIUM|REQUIRE_APPROVAL|OUTSIDE_WORKSPACE|write ../secrets/A.kt
+```
+
+- Versioned and line-based: a file the app does not understand is refused
+  (EMPTY / BAD_HEADER / UNSUPPORTED_VERSION / TOO_LARGE) rather than read
+  wrongly, and an unknown level, decision or reason code is not guessed at.
+- Append friendly: encodeLine writes one record, so storage can append instead
+  of rewriting; encode writes the header plus the newest MAX_ENTRIES.
+- A torn last line is counted, not fatal: the app appends while it runs, so a
+  crash can leave half a line; Decoded.skippedLines reports the damage instead
+  of making the whole trail unreadable.
+- No secrets on disk: only actor, level, decision, codes and the redacted
+  summary are stored, and SecretRedaction runs again on read because a
+  hand-edited file can carry anything.
+- InMemoryPolicyAuditLog.exportText()/restore() move the trail through the
+  format. A rejected file, or one with nothing readable in it, leaves the
+  in-memory trail untouched - losing live decisions to a torn stored copy would
+  be the worst of both.
+- Bounded: 256 KiB and 500 entries, so a long-lived file cannot grow forever.
+
+Tests: PolicyAuditFileTest (22).
+---
+ .../andcode/core/policy/PolicyAuditFile.kt    | 202 +++++++++++++
+ .../andcode/core/policy/PolicyAuditLog.kt     |  31 +-
+ .../core/policy/PolicyAuditFileTest.kt        | 277 ++++++++++++++++++
+ docs/POLICY_ENGINE.md                         |  34 ++-
+ 4 files changed, 537 insertions(+), 7 deletions(-)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFile.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFileTest.kt
+
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFile.kt b/app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFile.kt
+new file mode 100644
+index 0000000..1a0fa50
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFile.kt
+@@ -0,0 +1,202 @@
++package com.yugahashimoto.andcode.core.policy
++
++import com.yugahashimoto.andcode.core.security.SecretRedaction
++
++/** Why a saved audit trail could not be read. Data, not an exception: a corrupt file is expected. */
++enum class AuditRejection {
++    /** Nothing to read. */
++    EMPTY,
++
++    /** The first line is not `andcode-audit <version>`. */
++    BAD_HEADER,
++
++    /** Written by a newer app; refusing beats guessing at fields. */
++    UNSUPPORTED_VERSION,
++
++    /** Bigger than [PolicyAuditFile.MAX_BYTES]. */
++    TOO_LARGE,
++}
++
++/** The outcome of reading a saved trail. */
++sealed interface AuditDecodeResult {
++    /**
++     * [entries] are oldest first. [skippedLines] counts lines that could not be read: a trail is appended
++     * to while the app runs, so a torn last line after a crash is normal and must not make the rest
++     * unreadable - but it is reported, never hidden. [truncated] means the file held more than
++     * [PolicyAuditFile.MAX_ENTRIES] and only the newest were kept.
++     */
++    data class Decoded(
++        val entries: List<PolicyAuditEntry>,
++        val skippedLines: Int = 0,
++        val truncated: Boolean = false,
++    ) : AuditDecodeResult
++
++    data class Rejected(
++        val reason: AuditRejection,
++        val detail: String? = null,
++    ) : AuditDecodeResult
++}
++
++/**
++ * The file form of the policy audit trail.
++ *
++ * Why a file at all: a `DENY` that is forgotten when the process dies is not an audit trail. The in-memory
++ * log stays the source of truth while the app runs; this is only the format storage writes at the end of a
++ * session and reads at the start of the next one.
++ *
++ * Design constraints, all of them from the fact that this is a security record:
++ * - **Line-based and versioned** (`andcode-audit 1`), so an unreadable file is a visible refusal rather
++ *   than a wrong interpretation.
++ * - **Append friendly**: [encodeLine] produces one line, so a storage layer can append instead of
++ *   rewriting the whole file. [encode] writes header plus the newest [MAX_ENTRIES] lines.
++ * - **Torn lines are counted, not fatal.** Each bad line is skipped and counted in
++ *   [AuditDecodeResult.Decoded.skippedLines]; a bad header or a newer version rejects the whole file.
++ * - **No raw commands.** Only the redacted [PolicyAuditEntry.operation], the reason codes and the actor are
++ *   stored; [SecretRedaction] is applied again on both encode and decode, because a hand-edited file can
++ *   carry anything.
++ * - **Bounded.** [MAX_BYTES] and [MAX_ENTRIES] keep a long-lived file from growing without limit.
++ */
++object PolicyAuditFile {
++    const val MAGIC = "andcode-audit"
++    const val VERSION = 1
++    const val MAX_BYTES = 256 * 1024
++    const val MAX_ENTRIES = 500
++
++    private const val SEPARATOR = '|'
++    private const val FIELD_COUNT = 6
++
++    /** A whole file: the header followed by the newest [MAX_ENTRIES] entries, oldest first. */
++    fun encode(entries: List<PolicyAuditEntry>): String =
++        buildString {
++            append(MAGIC).append(' ').append(VERSION).append('\n')
++            entries.takeLast(MAX_ENTRIES).forEach { entry -> append(encodeLine(entry)).append('\n') }
++        }
++
++    /** One record, for an append-only file that already has a header. */
++    fun encodeLine(entry: PolicyAuditEntry): String =
++        listOf(
++            entry.timestampMs.toString(),
++            escape(entry.actor),
++            entry.level.name,
++            entry.decision.name,
++            entry.codes.joinToString(",") { code -> code.name },
++            escape(SecretRedaction.redact(entry.operation)),
++        ).joinToString(SEPARATOR.toString())
++
++    fun decode(text: String): AuditDecodeResult {
++        if (text.isBlank()) return AuditDecodeResult.Rejected(AuditRejection.EMPTY)
++        if (text.length > MAX_BYTES) {
++            return AuditDecodeResult.Rejected(AuditRejection.TOO_LARGE, "${text.length} characters")
++        }
++
++        val lines = text.split('\n').map { line -> line.trimEnd('\r') }
++        val headerIndex = lines.indexOfFirst { line -> line.isNotBlank() }
++        if (headerIndex < 0) return AuditDecodeResult.Rejected(AuditRejection.EMPTY)
++        val header = lines[headerIndex].trim()
++        val parts = header.split(' ')
++        if (parts.size != 2 || parts[0] != MAGIC) {
++            return AuditDecodeResult.Rejected(AuditRejection.BAD_HEADER, header.take(MAX_DETAIL_LENGTH))
++        }
++        val version = parts[1].toIntOrNull()
++        if (version == null) {
++            return AuditDecodeResult.Rejected(AuditRejection.BAD_HEADER, header.take(MAX_DETAIL_LENGTH))
++        }
++        if (version != VERSION) {
++            return AuditDecodeResult.Rejected(
++                AuditRejection.UNSUPPORTED_VERSION,
++                "file version $version, this app reads $VERSION",
++            )
++        }
++
++        val entries = mutableListOf<PolicyAuditEntry>()
++        var skipped = 0
++        for (index in headerIndex + 1 until lines.size) {
++            val line = lines[index]
++            if (line.isBlank()) continue
++            val entry = parseLine(line)
++            if (entry == null) skipped++ else entries += entry
++        }
++        val truncated = entries.size > MAX_ENTRIES
++        return AuditDecodeResult.Decoded(
++            entries = entries.takeLast(MAX_ENTRIES),
++            skippedLines = skipped,
++            truncated = truncated,
++        )
++    }
++
++    /** Splits one record, or null when it cannot be read as one. Reasons stay internal: the count is the report. */
++    private fun parseLine(line: String): PolicyAuditEntry? {
++        val fields = splitEscaped(line) ?: return null
++        if (fields.size != FIELD_COUNT) return null
++        val timestamp = fields[0].toLongOrNull() ?: return null
++        val actor = fields[1].takeIf { it.isNotBlank() } ?: return null
++        val level = RiskLevel.entries.firstOrNull { it.name == fields[2] } ?: return null
++        val decision = PolicyDecision.entries.firstOrNull { it.name == fields[3] } ?: return null
++        val codes =
++            if (fields[4].isBlank()) {
++                emptyList()
++            } else {
++                fields[4].split(',').map { name ->
++                    PolicyReasonCode.entries.firstOrNull { it.name == name } ?: return null
++                }
++            }
++        val operation = SecretRedaction.redact(fields[5])
++        return PolicyAuditEntry(
++            timestampMs = timestamp,
++            actor = actor,
++            operation = operation,
++            level = level,
++            decision = decision,
++            codes = codes,
++        )
++    }
++
++    // --- Escaping ---------------------------------------------------------------------------------
++
++    private fun escape(value: String): String =
++        buildString(value.length) {
++            value.forEach { char ->
++                when (char) {
++                    '\\' -> append("\\\\")
++                    SEPARATOR -> append("\\p")
++                    '\n' -> append("\\n")
++                    '\r' -> append("\\r")
++                    else -> append(char)
++                }
++            }
++        }
++
++    /** Null when a value ends in a dangling backslash, which means the line was cut. */
++    private fun splitEscaped(line: String): List<String>? {
++        val fields = mutableListOf<String>()
++        val current = StringBuilder()
++        var index = 0
++        while (index < line.length) {
++            val char = line[index]
++            when {
++                char == '\\' -> {
++                    val next = line.getOrNull(index + 1) ?: return null
++                    when (next) {
++                        '\\' -> current.append('\\')
++                        'p' -> current.append(SEPARATOR)
++                        'n' -> current.append('\n')
++                        'r' -> current.append('\r')
++                        else -> current.append(next)
++                    }
++                    index += 2
++                    continue
++                }
++                char == SEPARATOR -> {
++                    fields += current.toString()
++                    current.clear()
++                }
++                else -> current.append(char)
++            }
++            index++
++        }
++        fields += current.toString()
++        return fields
++    }
++
++    private const val MAX_DETAIL_LENGTH = 80
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditLog.kt b/app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditLog.kt
+index 6725c9e..2863472 100644
+--- a/app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditLog.kt
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/policy/PolicyAuditLog.kt
+@@ -27,8 +27,9 @@ data class PolicyAuditEntry(
+  * process is a leak. The oldest entry is dropped once [maxEntries] is reached, so whatever the user
+  * needs to review is always the recent past.
+  *
+- * This is not tamper-evident storage and does not survive process death; if the trail has to outlive
+- * the session it belongs in an append-only file, which is a separate, reviewed change.
++ * This is not tamper-evident storage and, on its own, does not survive process death. [exportText] and
++ * [restore] move the trail through [PolicyAuditFile], the versioned file format; the app still has to call
++ * them from its storage layer, which is Android work rather than core work.
+  */
+ class InMemoryPolicyAuditLog(
+     private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
+@@ -70,6 +71,32 @@ class InMemoryPolicyAuditLog(
+     /** Oldest first. A copy, so callers cannot mutate the trail by accident. */
+     fun snapshot(): List<PolicyAuditEntry> = synchronized(lock) { entries.toList() }
+ 
++    /**
++     * The trail in the format [PolicyAuditFile] reads back, for storage that outlives the process. Kept as
++     * a separate call rather than a side effect of [record]: the log has no file to write to, and hiding
++     * disk access inside a `record` would make every decision a potential IO failure.
++     */
++    fun exportText(): String = PolicyAuditFile.encode(snapshot())
++
++    /**
++     * Replaces the trail with a saved one, oldest first, trimmed to [maxEntries].
++     *
++     * A rejected file changes nothing, and so does a file whose lines were all unreadable: losing the
++     * decisions currently in memory because the stored copy is torn would be the worst of both. The
++     * result is returned so the caller can tell the user how many lines were dropped.
++     */
++    fun restore(text: String): AuditDecodeResult {
++        val result = PolicyAuditFile.decode(text)
++        if (result is AuditDecodeResult.Decoded && (result.entries.isNotEmpty() || result.skippedLines == 0)) {
++            synchronized(lock) {
++                entries.clear()
++                result.entries.forEach { entry -> entries.addLast(entry) }
++                while (entries.size > maxEntries) entries.removeFirst()
++            }
++        }
++        return result
++    }
++
+     val size: Int get() = synchronized(lock) { entries.size }
+ 
+     companion object {
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFileTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFileTest.kt
+new file mode 100644
+index 0000000..3b98d1a
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/policy/PolicyAuditFileTest.kt
+@@ -0,0 +1,277 @@
++package com.yugahashimoto.andcode.core.policy
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class PolicyAuditFileTest {
++    private fun entry(
++        timestampMs: Long,
++        operation: String = "write src/A.kt",
++        actor: String = "agent:write_file",
++        level: RiskLevel = RiskLevel.LOW,
++        decision: PolicyDecision = PolicyDecision.ALLOW,
++        codes: List<PolicyReasonCode> = listOf(PolicyReasonCode.INSIDE_WORKSPACE),
++    ) = PolicyAuditEntry(
++        timestampMs = timestampMs,
++        actor = actor,
++        operation = operation,
++        level = level,
++        decision = decision,
++        codes = codes,
++    )
++
++    private fun decoded(text: String): AuditDecodeResult.Decoded =
++        PolicyAuditFile.decode(text) as AuditDecodeResult.Decoded
++
++    @Test
++    fun `a trail survives a write and a read unchanged`() {
++        val original =
++            listOf(
++                entry(1, decision = PolicyDecision.REQUIRE_APPROVAL, level = RiskLevel.HIGH),
++                entry(2, operation = "rm -rf /", decision = PolicyDecision.DENY, level = RiskLevel.CRITICAL),
++            )
++
++        val result = decoded(PolicyAuditFile.encode(original))
++
++        assertEquals(original, result.entries)
++        assertEquals(0, result.skippedLines)
++        assertFalse(result.truncated)
++    }
++
++    @Test
++    fun `the file names its format and version on the first line`() {
++        val text = PolicyAuditFile.encode(listOf(entry(1)))
++
++        assertEquals("andcode-audit 1", text.lines().first())
++    }
++
++    @Test
++    fun `the newest entries are written when the trail is over the limit`() {
++        val entries = (1..PolicyAuditFile.MAX_ENTRIES + 5L).map { timestamp -> entry(timestamp) }
++
++        val result = decoded(PolicyAuditFile.encode(entries))
++
++        assertEquals(PolicyAuditFile.MAX_ENTRIES, result.entries.size)
++        assertEquals(PolicyAuditFile.MAX_ENTRIES + 5L, result.entries.last().timestampMs)
++        assertFalse(result.truncated)
++    }
++
++    @Test
++    fun `a file with more entries than the reader keeps reports the truncation`() {
++        val text =
++            buildString {
++                appendLine("andcode-audit 1")
++                repeat(PolicyAuditFile.MAX_ENTRIES + 2) { index -> appendLine(PolicyAuditFile.encodeLine(entry(index.toLong()))) }
++            }
++
++        val result = decoded(text)
++
++        assertEquals(PolicyAuditFile.MAX_ENTRIES, result.entries.size)
++        assertTrue(result.truncated)
++        assertEquals(PolicyAuditFile.MAX_ENTRIES + 1L, result.entries.last().timestampMs)
++    }
++
++    @Test
++    fun `a pipe in the operation does not split the record`() {
++        val original = entry(7, operation = "run cat a.txt | tee b.txt")
++
++        val result = decoded(PolicyAuditFile.encode(listOf(original)))
++
++        assertEquals(1, result.entries.size)
++        assertEquals("run cat a.txt | tee b.txt", result.entries[0].operation)
++    }
++
++    @Test
++    fun `a newline and a backslash in the operation survive`() {
++        val messy = "line1\\path\nline2\rline3"
++        val original = entry(9, operation = messy)
++
++        val result = decoded(PolicyAuditFile.encode(listOf(original)))
++
++        assertEquals(messy, result.entries[0].operation)
++        assertEquals(1, result.entries.size)
++    }
++
++    @Test
++    fun `a credential is redacted on the way in and on the way out`() {
++        val written = PolicyAuditFile.encode(listOf(entry(1, operation = "curl -H 'Authorization: Bearer abcdefghijkl'")))
++        assertFalse(written.contains("abcdefghijkl"))
++
++        val handEdited = "andcode-audit 1\n1|agent:bash|HIGH|DENY|SECRET_PATH|curl --token sk-proj-abcdefghijklmnop\n"
++        val read = decoded(handEdited)
++
++        assertEquals(1, read.entries.size)
++        assertFalse(read.entries[0].operation.contains("sk-proj-abcdefghijklmnop"))
++    }
++
++    @Test
++    fun `an empty file is rejected as empty`() {
++        val result = PolicyAuditFile.decode("  \n\n")
++
++        assertEquals(AuditRejection.EMPTY, (result as AuditDecodeResult.Rejected).reason)
++    }
++
++    @Test
++    fun `a wrong header is rejected instead of guessed at`() {
++        val result = PolicyAuditFile.decode("something-else 1\n1|a|LOW|ALLOW||x")
++
++        assertEquals(AuditRejection.BAD_HEADER, (result as AuditDecodeResult.Rejected).reason)
++    }
++
++    @Test
++    fun `a newer file version is refused rather than half read`() {
++        val result = PolicyAuditFile.decode("andcode-audit 2\n1|a|LOW|ALLOW||x")
++
++        val rejected = result as AuditDecodeResult.Rejected
++        assertEquals(AuditRejection.UNSUPPORTED_VERSION, rejected.reason)
++        assertTrue(rejected.detail!!.contains("2"))
++    }
++
++    @Test
++    fun `an oversized file is refused without being scanned`() {
++        val text = "andcode-audit 1\n" + "x".repeat(PolicyAuditFile.MAX_BYTES)
++
++        val result = PolicyAuditFile.decode(text)
++
++        assertEquals(AuditRejection.TOO_LARGE, (result as AuditDecodeResult.Rejected).reason)
++    }
++
++    @Test
++    fun `a torn last line is skipped and counted, and the rest is kept`() {
++        val text =
++            "andcode-audit 1\n" +
++                PolicyAuditFile.encodeLine(entry(1)) + "\n" +
++                "2|agent:bash|HIGH|DENY|SECRET"
++
++        val result = decoded(text)
++
++        assertEquals(1, result.entries.size)
++        assertEquals(1, result.skippedLines)
++    }
++
++    @Test
++    fun `a line with an unknown level is skipped instead of being shown as something else`() {
++        val text =
++            "andcode-audit 1\n" +
++                "1|agent:bash|LOUD|DENY|SECRET_PATH|x\n" +
++                PolicyAuditFile.encodeLine(entry(2))
++
++        val result = decoded(text)
++
++        assertEquals(1, result.entries.size)
++        assertEquals(2L, result.entries[0].timestampMs)
++        assertEquals(1, result.skippedLines)
++    }
++
++    @Test
++    fun `a line with an unknown reason code is skipped`() {
++        val text = "andcode-audit 1\n1|agent:bash|LOW|ALLOW|NOT_A_CODE|x"
++
++        val result = decoded(text)
++
++        assertTrue(result.entries.isEmpty())
++        assertEquals(1, result.skippedLines)
++    }
++
++    @Test
++    fun `blank lines around the records are ignored, not counted as damage`() {
++        val text = "\nandcode-audit 1\n\n" + PolicyAuditFile.encodeLine(entry(1)) + "\n\n"
++
++        val result = decoded(text)
++
++        assertEquals(1, result.entries.size)
++        assertEquals(0, result.skippedLines)
++    }
++
++    @Test
++    fun `an entry without reason codes is read back as such`() {
++        val text = "andcode-audit 1\n1|agent:bash|LOW|ALLOW||no codes here"
++
++        val result = decoded(text)
++
++        assertTrue(result.entries[0].codes.isEmpty())
++        assertEquals("no codes here", result.entries[0].operation)
++    }
++
++    @Test
++    fun `the in-memory log exports and restores its trail`() {
++        val operation =
++            PolicyOperation(tool = "bash", kind = OperationKind.RUN_COMMAND, command = "cat /workspace/.env")
++        val assessment = RiskEngine.assess(operation, PolicyConfig())
++        val log = InMemoryPolicyAuditLog()
++        log.record(operation, assessment, timestampMs = 1)
++        log.record(operation, assessment, timestampMs = 2)
++
++        val next = InMemoryPolicyAuditLog()
++        val result = next.restore(log.exportText())
++
++        assertTrue(result is AuditDecodeResult.Decoded)
++        assertEquals(2, next.size)
++        assertEquals(log.snapshot(), next.snapshot())
++    }
++
++    @Test
++    fun `a restored trail is trimmed to the log's own limit`() {
++        val text = PolicyAuditFile.encode((1..5L).map { timestamp -> entry(timestamp) })
++        val log = InMemoryPolicyAuditLog(maxEntries = 2)
++
++        log.restore(text)
++
++        assertEquals(listOf(4L, 5L), log.snapshot().map { it.timestampMs })
++    }
++
++    @Test
++    fun `a rejected file leaves the current trail untouched`() {
++        val operation = PolicyOperation(tool = "bash", kind = OperationKind.RUN_COMMAND, command = "rm -rf /")
++        val log = InMemoryPolicyAuditLog()
++        log.record(operation, RiskEngine.assess(operation, PolicyConfig()), timestampMs = 1)
++
++        val result = log.restore("not our file")
++
++        assertTrue(result is AuditDecodeResult.Rejected)
++        assertEquals(1, log.size)
++    }
++
++    @Test
++    fun `a file whose every line is unreadable does not wipe the trail`() {
++        val operation = PolicyOperation(tool = "bash", kind = OperationKind.RUN_COMMAND, command = "rm -rf /")
++        val log = InMemoryPolicyAuditLog()
++        log.record(operation, RiskEngine.assess(operation, PolicyConfig()), timestampMs = 1)
++
++        val result = log.restore("andcode-audit 1\ngarbage\nalso garbage\n")
++
++        assertEquals(2, (result as AuditDecodeResult.Decoded).skippedLines)
++        assertEquals(1, log.size)
++    }
++
++    @Test
++    fun `a denied decision keeps its decision and codes through the file`() {
++        val original =
++            entry(
++                3,
++                operation = "fastboot flash boot boot.img",
++                actor = "agent:bash",
++                level = RiskLevel.CRITICAL,
++                decision = PolicyDecision.DENY,
++                codes = listOf(PolicyReasonCode.DEVICE_OPERATION, PolicyReasonCode.ELEVATED_COMMAND),
++            )
++
++        val restored = decoded(PolicyAuditFile.encode(listOf(original))).entries.single()
++
++        assertEquals(PolicyDecision.DENY, restored.decision)
++        assertEquals(RiskLevel.CRITICAL, restored.level)
++        assertEquals(listOf(PolicyReasonCode.DEVICE_OPERATION, PolicyReasonCode.ELEVATED_COMMAND), restored.codes)
++    }
++
++    @Test
++    fun `an actor that carries a separator survives`() {
++        val original = entry(4, actor = "user:ask|confirm")
++
++        val restored = decoded(PolicyAuditFile.encode(listOf(original))).entries.single()
++
++        assertEquals("user:ask|confirm", restored.actor)
++        assertEquals(original, restored)
++    }
++}
+diff --git a/docs/POLICY_ENGINE.md b/docs/POLICY_ENGINE.md
+index 321b57c..f3e722b 100644
+--- a/docs/POLICY_ENGINE.md
++++ b/docs/POLICY_ENGINE.md
+@@ -19,13 +19,35 @@ is meant to be wired in.
+ | `PolicyPaths.kt` | Guest path canonicalisation, containment and glob-lite matching |
+ | `RiskAssessment.kt` | `PolicyDecision` (`ALLOW` / `REQUIRE_APPROVAL` / `DENY`), reason codes, reasons |
+ | `PolicyAuditLog.kt` | Bounded in-memory trail of decisions, with redacted summaries and codes only |
++| `PolicyAuditFile.kt` | The versioned file form of that trail: `encode`, one-line append, strict `decode` |
+ | `ToolCallMapper.kt` | `ToolCall(name, flat args)` → `PolicyOperation`, the CLI-independent half of the wiring |
+ | `core/task/TaskState.kt` | The task states the UI shows, plus `TaskFacts` |
+ | `core/task/TaskStateMachine.kt` | Allowed transitions and the guards on them |
+ | `core/task/TaskProgress.kt`, `TaskLimits.kt`, `TaskResume.kt` | Saved state, hard stops, and the resume/confirm/cancel rules |
+ 
+-Tests: `RiskEngineTest`, `CommandInspectorTest`, `PolicyAuditLogTest`, `ToolCallMapperTest`,
+-`TaskStateMachineTest`, `TaskResumeTest`.
++Tests: `RiskEngineTest`, `CommandInspectorTest`, `PolicyAuditLogTest`, `PolicyAuditFileTest`,
++`ToolCallMapperTest`, `TaskStateMachineTest`, `TaskResumeTest`.
++
++## The saved trail
++
++`PolicyAuditFile` is the part of "an audit trail" that has to outlive the process, kept separate from the
++log so that `record()` never does IO.
++
++```
++andcode-audit 1
++1700000000000|agent:write_file|MEDIUM|REQUIRE_APPROVAL|OUTSIDE_WORKSPACE|write ../secrets/A.kt
++```
++
++- **Versioned and line-based.** A file the app does not understand is refused (`BAD_HEADER`,
++  `UNSUPPORTED_VERSION`, `TOO_LARGE`, `EMPTY`) instead of being read wrongly.
++- **Append friendly**: `encodeLine` writes one record, so storage can append; `encode` writes the header
++  and the newest `MAX_ENTRIES` (500).
++- **A torn line is counted, not fatal**: the app appends while running, so a crash can leave half a line;
++  `Decoded.skippedLines` reports how many were dropped rather than making the rest unreadable.
++- **No raw commands**: only the actor, level, decision, reason codes and the redacted summary are stored,
++  and `SecretRedaction` runs again on read, because a hand-edited file can contain anything.
++- **Nothing is lost on a bad restore**: `InMemoryPolicyAuditLog.restore` leaves the in-memory trail alone
++  when the file is rejected or nothing in it could be read.
+ 
+ ## Decisions
+ 
+@@ -103,8 +125,9 @@ The remaining work, in order:
+    the way the existing "always" path does, `REQUIRE_APPROVAL` shows the current approval sheet with the
+    level and reasons attached, `DENY` answers with `PermissionResponse.REJECT` and says why.
+ 3. Record every verdict with `InMemoryPolicyAuditLog` and surface its snapshot next to the task report.
+-4. Persist `TaskProgress` (steps + attempts + `startedAtMs`) so `TaskResume` has something to read after
+-   the app is closed, and route the cancel button through `TaskResume.cancel()`.
++4. Give `TaskProgress` a file: the format and strict reader exist (`core/task/TaskProgressCodec`), storage
++   does not. Same for the audit trail (`PolicyAuditFile` + `exportText`/`restore`), which now has a format
++   but no file. Route the cancel button through `TaskResume.cancel()`.
+ 
+ Until step 1 exists in code, treat the engine as tested but not yet enforcing.
+ 
+@@ -116,6 +139,7 @@ Until step 1 exists in code, treat the engine as tested but not yet enforcing.
+ ./gradlew detekt spotlessCheck
+ ```
+ 
+-77 test cases live in these two packages (plus one added to `SecretRedactionTest`).
++146 test cases live in these two packages (plus one added to `SecretRedactionTest`), counted in
++`patches/verification-log.txt`.
+ 
+ No emulator or device is needed: the whole package is plain JVM Kotlin.
+-- 
+2.39.5
+

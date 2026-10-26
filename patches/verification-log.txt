@@ -1,12 +1,12 @@
 # Verification transcript
-# Date: 2026-10-26T04:04:33Z
+# Date: 2026-10-26T04:12:25Z
 # Sandbox has no Android SDK, no gradle distribution and no Maven Central access, so Gradle
 # cannot run here. Instead the touched pure-Kotlin sources and the real committed JUnit test
 # sources were compiled with kotlinc (2.4.21) and executed against a minimal local stand-in for
 # the JUnit 4 API (org.junit.Test / org.junit.Assert). The test bodies are unmodified.
-# Sources are taken from a clean clone with all nine patches applied (git am).
+# Sources are taken from a clean clone with all ten patches applied (git am).
 
-$ git am 0001..0009   (fresh clone of yuga-hashimoto/and-code @ 414c780)
+$ git am 0001..0010   (fresh clone of yuga-hashimoto/and-code @ 414c780)
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
@@ -16,6 +16,7 @@ Applying: feat(task): build the end-of-task report with a verdict that cannot be
 Applying: feat(task): add a runner that drives plan, policy, checks and report
 Applying: feat(task): add a strict, dependency-free format for a saved task
 Applying: feat(buildcheck): read per-test results out of a check's output
+Applying: feat(policy): save the audit trail in a versioned, append-friendly file format
 
 $ java -version
 openjdk version "25.0.2" 2026-01-20 LTS
@@ -130,6 +131,29 @@ $ java -cp out RunnerKt
   PASS matching ignores case and extra whitespace
   PASS pipes inside a quoted argument are not mistaken for a shell pipe
   PASS read-only detection rejects redirection and substitution
+== com.yugahashimoto.andcode.core.policy.PolicyAuditFileTest (22 tests)
+  PASS a credential is redacted on the way in and on the way out
+  PASS a denied decision keeps its decision and codes through the file
+  PASS a file whose every line is unreadable does not wipe the trail
+  PASS a file with more entries than the reader keeps reports the truncation
+  PASS a line with an unknown level is skipped instead of being shown as something else
+  PASS a line with an unknown reason code is skipped
+  PASS a newer file version is refused rather than half read
+  PASS a newline and a backslash in the operation survive
+  PASS a pipe in the operation does not split the record
+  PASS a rejected file leaves the current trail untouched
+  PASS a restored trail is trimmed to the log's own limit
+  PASS a torn last line is skipped and counted, and the rest is kept
+  PASS a trail survives a write and a read unchanged
+  PASS a wrong header is rejected instead of guessed at
+  PASS an actor that carries a separator survives
+  PASS an empty file is rejected as empty
+  PASS an entry without reason codes is read back as such
+  PASS an oversized file is refused without being scanned
+  PASS blank lines around the records are ignored, not counted as damage
+  PASS the file names its format and version on the first line
+  PASS the in-memory log exports and restores its trail
+  PASS the newest entries are written when the trail is over the limit
 == com.yugahashimoto.andcode.core.policy.PolicyAuditLogTest (4 tests)
   PASS a non-positive capacity is refused
   PASS an entry keeps the codes and the redacted summary
@@ -268,11 +292,11 @@ $ java -cp out RunnerKt
   PASS the full happy path is allowed
 == org.junit.Test (0 tests)
 
-RESULT passed=224 failed=0
+RESULT passed=246 failed=0
 run exit=0
 
 # Style checks the sandbox could not run through Gradle: line length / trailing whitespace / final newline
-files checked=43 issues=0
+files checked=45 issues=0
 
 $ git diff --shortstat 414c780 HEAD   (inside the clean clone)
- 49 files changed, 7066 insertions(+)
+ 51 files changed, 7596 insertions(+)

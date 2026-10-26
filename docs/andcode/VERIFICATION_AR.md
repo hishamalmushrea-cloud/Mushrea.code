@@ -34,6 +34,7 @@ Maven.
 == core.capability.CapabilityValidatorTest  (16 tests) -> 16 PASS
 == core.memory.ProjectMemoryTest            (15 tests) -> 15 PASS
 == core.policy.CommandInspectorTest         (12 tests) -> 12 PASS
+== core.policy.PolicyAuditFileTest          (22 tests) -> 22 PASS
 == core.policy.PolicyAuditLogTest            (4 tests) ->  4 PASS
 == core.policy.RiskEngineTest               (23 tests) -> 23 PASS
 == core.policy.ToolCallMapperTest           (11 tests) -> 11 PASS
@@ -44,10 +45,10 @@ Maven.
 == core.task.TaskRunnerTest                 (18 tests) -> 18 PASS
 == core.task.TaskStateMachineTest           (11 tests) -> 11 PASS
 
-RESULT passed=224 failed=0
+RESULT passed=246 failed=0
 ```
 
-المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّقت عليها الـ patches التسعة بـ `git am`** (لا
+المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّقت عليها الـ patches العشرة بـ `git am`** (لا
 من شجرة عمل معدّلة يدويًا)، أي أن ما تم تشغيله هو بالضبط ما سيصل إلى المستودع.
 
 الشيفرة تُترجم بلا أخطاء ولا تحذيرات، والاختبارات الـ 14 القائمة لـ`SecretRedaction` تمر بعد إضافة النمط
@@ -70,14 +71,14 @@ RESULT passed=224 failed=0
 ### فحوص تنسيق أُجريت يدويًا (لأن spotless غير متاح)
 
 سكربت فحص على الملفات المتأثرة: طول السطر ≤ 140، لا مسافات زائدة في نهاية السطر، لا تبويبات،
-سطر جديد في نهاية الملف → `files checked=43 issues=0` على كل ملفات الحزم الجديدة. الملفات تتبع أسلوب المستودع (تعليقات KDoc
+سطر جديد في نهاية الملف → `files checked=45 issues=0` على كل ملفات الحزم الجديدة. الملفات تتبع أسلوب المستودع (تعليقات KDoc
 تشرح السبب، أسماء اختبارات بين backticks، فواصل لاحقة trailing commas كما في بقية المشروع).
 
 ## فحص تطبيق الـ patches على نسخة نظيفة
 
 ```
 $ git clone --depth 1 https://github.com/yuga-hashimoto/and-code.git /tmp/applycheck2
-$ git am patches/0001-*.patch ... patches/0009-*.patch
+$ git am patches/0001-*.patch ... patches/0010-*.patch
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
@@ -87,21 +88,23 @@ Applying: feat(task): build the end-of-task report with a verdict that cannot be
 Applying: feat(task): add a runner that drives plan, policy, checks and report
 Applying: feat(task): add a strict, dependency-free format for a saved task
 Applying: feat(buildcheck): read per-test results out of a check's output
-$ git log --oneline -10
-40bb7bd feat(buildcheck): read per-test results out of a check's output
-bf7d7a5 feat(task): add a strict, dependency-free format for a saved task
-7d4502a feat(task): add a runner that drives plan, policy, checks and report
-efb9460 feat(task): build the end-of-task report with a verdict that cannot be talked up
-5a84aac feat(buildcheck): detect the project type and plan bounded, classified checks
-64d4dbc feat(memory): add a project memory that refuses secrets and mistrusts summaries
-8ba1927 feat(capability): add a validated capability registry with a lifecycle
-88ac391 feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
-8c8cbc7 feat(policy): add an in-app risk engine and task state machine
+Applying: feat(policy): save the audit trail in a versioned, append-friendly file format
+$ git log --oneline -11
+d1b7394 feat(policy): save the audit trail in a versioned, append-friendly file format
+ae1719c feat(buildcheck): read per-test results out of a check's output
+8b2664e feat(task): add a strict, dependency-free format for a saved task
+cbacc56 feat(task): add a runner that drives plan, policy, checks and report
+48d408a feat(task): build the end-of-task report with a verdict that cannot be talked up
+56030ec feat(buildcheck): detect the project type and plan bounded, classified checks
+899401b feat(memory): add a project memory that refuses secrets and mistrusts summaries
+e227757 feat(capability): add a validated capability registry with a lifecycle
+4382803 feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+46a357f feat(policy): add an in-app risk engine and task state machine
 414c780 Merge pull request #404 from yuga-hashimoto/feat/402-edit-local-workspace-files
 ```
 
-أي أن الـ patches التسعة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، وتشغيل الاختبارات
-أعلاه جرى على هذه النسخة بالضبط (43 ملفًا فُحص تنسيقيًا: لا سطر > 140، لا مسافات زائدة).
+أي أن الـ patches العشرة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، وتشغيل الاختبارات
+أعلاه جرى على هذه النسخة بالضبط (45 ملفًا فُحص تنسيقيًا: لا سطر > 140، لا مسافات زائدة).
 
 ## ما لم يُشغَّل (وهذا مذكور كقيد، لا كنجاح)
 
