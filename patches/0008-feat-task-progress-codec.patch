@@ -1,0 +1,521 @@
+From 88a37723e9033dc9e0cc458775ac3199a8f2fe69 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 26 Oct 2026 03:59:04 +0000
+Subject: [PATCH] feat(task): add a strict, dependency-free format for a saved
+ task
+
+Eighth slice: the half of "resume after the app was closed" that needs no
+Android, so it can actually be tested here.
+
+core/task/TaskProgressCodec:
+- A line-based format with a version header and one line per step. Hand-written
+  rather than kotlinx.serialization because the file has to stay readable by a
+  resumed process across app versions, must not change shape when a data class
+  gains a field, and should be diffable in a bug report.
+- The reader is strict: a wrong magic, a newer version, an oversized file
+  (64 KiB), more than 200 steps, a malformed line, a bad value or a duplicate
+  step id are all refused with a named DecodeRejection - a corrupt file never
+  half-loads. Unknown fields are ignored *and reported*, so a newer writer does
+  not break an older reader.
+- Values are escaped (backslash, pipe, newline, carriage return), so a failure
+  message can never break the record, and the message is redacted on the way in
+  and on the way out - a step that failed while quoting a token cannot persist
+  it.
+- A decoded task feeds straight into TaskResume, which the tests check.
+
+Two real bugs the tests caught, both fixed: an empty timestamp column was
+treated as an error, which rejected every step that had not started or finished
+yet; and the failure column was redacted but never escaped, so a message with a
+newline or a pipe corrupted the file.
+
+Tests: TaskProgressCodecTest (17).
+---
+ .../andcode/core/task/TaskProgressCodec.kt    | 243 ++++++++++++++++++
+ .../core/task/TaskProgressCodecTest.kt        | 170 ++++++++++++
+ docs/TASK_LIFECYCLE.md                        |  33 ++-
+ 3 files changed, 443 insertions(+), 3 deletions(-)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgressCodec.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/task/TaskProgressCodecTest.kt
+
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgressCodec.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgressCodec.kt
+new file mode 100644
+index 0000000..f6897a6
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskProgressCodec.kt
+@@ -0,0 +1,243 @@
++package com.yugahashimoto.andcode.core.task
++
++import com.yugahashimoto.andcode.core.security.SecretRedaction
++
++/** Why a stored task could not be read back. Every case is reported, never thrown. */
++enum class DecodeRejection {
++    EMPTY,
++
++    /** Not a task file at all. */
++    BAD_HEADER,
++
++    /** Written by a newer app; refusing is safer than guessing at the format. */
++    UNSUPPORTED_VERSION,
++
++    /** Larger than [TaskProgressCodec.MAX_BYTES]; refused rather than parsed. */
++    TOO_LARGE,
++
++    /** More steps than [TaskProgressCodec.MAX_STEPS]. */
++    TOO_MANY_STEPS,
++
++    /** A line that is not `key=value`, or a step line with the wrong column count. */
++    MALFORMED_LINE,
++
++    /** A value that does not parse: unknown state, negative attempt count, bad number, invalid step id. */
++    INVALID_VALUE,
++
++    /** The same step id twice. */
++    DUPLICATE_STEP,
++}
++
++sealed interface TaskDecodeResult {
++    /**
++     * [unknownKeys] lists fields this version of the app did not understand. They are ignored, not fatal, so a
++     * newer writer does not corrupt an older reader - but the caller can log them while diagnosing a resume.
++     */
++    data class Decoded(
++        val progress: TaskProgress,
++        val unknownKeys: List<String>,
++    ) : TaskDecodeResult
++
++    data class Rejected(
++        val reason: DecodeRejection,
++        val detail: String,
++    ) : TaskDecodeResult
++}
++
++/**
++ * Line-based, dependency-free format for a saved task.
++ *
++ * Hand-written rather than `kotlinx.serialization` on purpose: this has to be readable by a resumed process
++ * on any app version, must not silently change shape when a data class gains a field, and must be diffable
++ * in a bug report. It is also the reason the format has a version header and explicit bounds: a corrupt or
++ * hostile file must fail loudly, not half-load.
++ *
++ * ```
++ * andcode-task 1
++ * state=RUNNING
++ * attempts=1
++ * startedAt=1700000000000
++ * pausedAt=
++ * step=edit|DONE|1|1|1700000000001|1700000000002|
++ * ```
++ *
++ * The last column is the failure message, escaped: `\\` for a backslash, `\p` for a pipe, `\n` and `\r` for
++ * newlines, so a message can never break the record. It is passed through [SecretRedaction] on the way in
++ * and on the way out, so a step that failed while quoting a token cannot persist it.
++ */
++object TaskProgressCodec {
++    const val MAGIC = "andcode-task"
++    const val VERSION = 1
++
++    /** 64 KiB is far more than [TaskLimits.DEFAULT_MAX_STEPS] steps can need. */
++    const val MAX_BYTES = 64 * 1024
++    const val MAX_STEPS = 200
++
++    private const val STEP_PREFIX = "step="
++    private const val COLUMNS = 7
++    private val STEP_ID = Regex("^[A-Za-z0-9._:-]{1,64}$")
++
++    fun encode(progress: TaskProgress): String =
++        buildString {
++            appendLine("$MAGIC $VERSION")
++            appendLine("state=${progress.state.name}")
++            appendLine("attempts=${progress.attempts}")
++            appendLine("startedAt=${progress.startedAtMs}")
++            appendLine("pausedAt=${progress.pausedAtMs ?: ""}")
++            for (step in progress.steps.take(MAX_STEPS)) {
++                append(STEP_PREFIX)
++                append(escape(step.id))
++                append('|').append(step.state.name)
++                append('|').append(if (step.sideEffecting) 1 else 0)
++                append('|').append(step.attempts)
++                append('|').append(step.startedAtMs ?: "")
++                append('|').append(step.finishedAtMs ?: "")
++                append('|').append(step.failure?.let { escape(SecretRedaction.redact(it)) }.orEmpty())
++                appendLine()
++            }
++        }.trimEnd('\n') + "\n"
++
++    fun decode(text: String): TaskDecodeResult {
++        if (text.isBlank()) return reject(DecodeRejection.EMPTY, "file is empty")
++        if (text.length > MAX_BYTES) return reject(DecodeRejection.TOO_LARGE, "${text.length} > $MAX_BYTES characters")
++
++        val lines = text.trimEnd('\n').split('\n')
++        val header = lines.first().trim()
++        if (!header.startsWith("$MAGIC ")) return reject(DecodeRejection.BAD_HEADER, "missing '$MAGIC' header")
++        val version = header.removePrefix("$MAGIC ").trim().toIntOrNull()
++        if (version != VERSION) return reject(DecodeRejection.UNSUPPORTED_VERSION, "version '$version', expected $VERSION")
++
++        val scalars = mutableMapOf<String, String>()
++        val steps = mutableListOf<String>()
++        val unknown = mutableListOf<String>()
++        for (line in lines.drop(1)) {
++            if (line.isBlank()) continue
++            if (line.startsWith(STEP_PREFIX)) {
++                steps += line.removePrefix(STEP_PREFIX)
++                continue
++            }
++            val key = line.substringBefore('=', "")
++            if (key.isEmpty() || !line.contains('=')) {
++                return reject(DecodeRejection.MALFORMED_LINE, "not key=value: ${line.take(40)}")
++            }
++            when (key) {
++                "state", "attempts", "startedAt", "pausedAt" -> scalars[key] = line.substringAfter('=')
++                else -> unknown += key
++            }
++        }
++        if (steps.size > MAX_STEPS) return reject(DecodeRejection.TOO_MANY_STEPS, "${steps.size} > $MAX_STEPS")
++
++        val state =
++            scalars["state"]?.let { value -> TaskState.entries.firstOrNull { it.name == value } }
++                ?: return reject(DecodeRejection.INVALID_VALUE, "state '${scalars["state"]}' is not a known state")
++        val attempts = scalars["attempts"]?.toIntOrNull()
++            ?: return reject(DecodeRejection.INVALID_VALUE, "attempts is missing or not a number")
++        if (attempts < 0) return reject(DecodeRejection.INVALID_VALUE, "attempts is negative")
++        val startedAt = scalars["startedAt"]?.toLongOrNull()
++            ?: return reject(DecodeRejection.INVALID_VALUE, "startedAt is missing or not a number")
++        val rawPausedAt = scalars["pausedAt"].orEmpty()
++        val pausedAt =
++            if (rawPausedAt.isEmpty()) {
++                null
++            } else {
++                rawPausedAt.toLongOrNull() ?: return reject(DecodeRejection.INVALID_VALUE, "pausedAt is not a number")
++            }
++
++        val parsedSteps = mutableListOf<TaskStep>()
++        val seen = mutableSetOf<String>()
++        for (raw in steps) {
++            when (val parsed = parseStep(raw)) {
++                is StepParse.Rejected -> return reject(parsed.reason, parsed.detail)
++                is StepParse.Parsed -> {
++                    if (!seen.add(parsed.step.id)) {
++                        return reject(DecodeRejection.DUPLICATE_STEP, "step '${parsed.step.id}' appears twice")
++                    }
++                    parsedSteps += parsed.step
++                }
++            }
++        }
++        val progress = TaskProgress(state, parsedSteps, attempts, startedAt, pausedAt)
++        return TaskDecodeResult.Decoded(progress, unknown.distinct())
++    }
++
++    private sealed interface StepParse {
++        data class Parsed(val step: TaskStep) : StepParse
++
++        data class Rejected(val reason: DecodeRejection, val detail: String) : StepParse
++    }
++
++    /** Parses one step record. A wrong shape and a wrong value are both reported, never guessed at. */
++    private fun parseStep(raw: String): StepParse {
++        val columns = raw.split('|')
++        if (columns.size < COLUMNS) {
++            return StepParse.Rejected(DecodeRejection.MALFORMED_LINE, "step line has fewer than $COLUMNS columns")
++        }
++        val id = unescape(columns[0])
++        if (id.isEmpty() || !STEP_ID.matches(id)) {
++            return StepParse.Rejected(DecodeRejection.INVALID_VALUE, "step id '$id' is not allowed")
++        }
++        val state =
++            StepState.entries.firstOrNull { it.name == columns[1] }
++                ?: return StepParse.Rejected(DecodeRejection.INVALID_VALUE, "step '$id' has unknown state '${columns[1]}'")
++        val sideEffecting =
++            when (columns[2]) {
++                "1", "true" -> true
++                "0", "false" -> false
++                else -> return StepParse.Rejected(DecodeRejection.INVALID_VALUE, "step '$id' has a non-boolean sideEffecting")
++            }
++        val attempts =
++            columns[3].toIntOrNull()
++                ?: return StepParse.Rejected(DecodeRejection.INVALID_VALUE, "step '$id' attempts is not a number")
++        if (attempts < 0) return StepParse.Rejected(DecodeRejection.INVALID_VALUE, "step '$id' attempts is negative")
++        // An empty column means "no timestamp", which is unknown-but-valid; only a non-empty non-number is an
++        // error. Conflating the two rejected every step that had not started or finished yet.
++        val startedAt =
++            if (columns[4].isEmpty()) {
++                null
++            } else {
++                columns[4].toLongOrNull()
++                    ?: return StepParse.Rejected(DecodeRejection.INVALID_VALUE, "step '$id' startedAt is not a number")
++            }
++        val finishedAt =
++            if (columns[5].isEmpty()) {
++                null
++            } else {
++                columns[5].toLongOrNull()
++                    ?: return StepParse.Rejected(DecodeRejection.INVALID_VALUE, "step '$id' finishedAt is not a number")
++            }
++        // Columns beyond the sixth are part of the message: a pipe that survived escaping must not truncate it.
++        val failure = columns.drop(6).joinToString("|").takeIf { it.isNotEmpty() }?.let { SecretRedaction.redact(unescape(it)) }
++        return StepParse.Parsed(TaskStep(id, state, sideEffecting, attempts, startedAt, finishedAt, failure))
++    }
++
++
++    private fun reject(
++        reason: DecodeRejection,
++        detail: String,
++    ) = TaskDecodeResult.Rejected(reason, SecretRedaction.redact(detail))
++
++    private fun escape(value: String): String =
++        value.replace("\\", "\\\\").replace("|", "\\p").replace("\n", "\\n").replace("\r", "\\r")
++
++    private fun unescape(value: String): String {
++        val out = StringBuilder(value.length)
++        var index = 0
++        while (index < value.length) {
++            val char = value[index]
++            if (char == '\\' && index + 1 < value.length) {
++                when (val next = value[index + 1]) {
++                    '\\' -> out.append('\\')
++                    'p' -> out.append('|')
++                    'n' -> out.append('\n')
++                    'r' -> out.append('\r')
++                    else -> out.append(next)
++                }
++                index += 2
++            } else {
++                out.append(char)
++                index++
++            }
++        }
++        return out.toString()
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskProgressCodecTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskProgressCodecTest.kt
+new file mode 100644
+index 0000000..482ee37
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskProgressCodecTest.kt
+@@ -0,0 +1,170 @@
++package com.yugahashimoto.andcode.core.task
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class TaskProgressCodecTest {
++    private val progress =
++        TaskProgress(
++            state = TaskState.RUNNING,
++            steps =
++                listOf(
++                    TaskStep("edit", StepState.DONE, sideEffecting = true, attempts = 1, startedAtMs = 10, finishedAtMs = 20),
++                    TaskStep("scan", StepState.RUNNING, sideEffecting = false, attempts = 2, startedAtMs = 20),
++                    TaskStep("write", StepState.FAILED, sideEffecting = true, attempts = 3, failure = "compile broke"),
++                ),
++            attempts = 3,
++            startedAtMs = 1_700_000_000_000,
++            pausedAtMs = null,
++        )
++
++    private fun decoded(text: String): TaskProgress =
++        (TaskProgressCodec.decode(text) as TaskDecodeResult.Decoded).progress
++
++    private fun rejection(text: String): DecodeRejection =
++        (TaskProgressCodec.decode(text) as TaskDecodeResult.Rejected).reason
++
++    @Test
++    fun `a saved task round trips exactly`() {
++        assertEquals(progress, decoded(TaskProgressCodec.encode(progress)))
++    }
++
++    @Test
++    fun `every state round trips`() {
++        for (state in TaskState.entries) {
++            val saved = progress.copy(state = state, steps = emptyList())
++            assertEquals(state, decoded(TaskProgressCodec.encode(saved)).state)
++        }
++        for (state in StepState.entries) {
++            val saved = TaskProgress(TaskState.RUNNING, listOf(TaskStep("s", state)), 0, 1)
++            assertEquals(state, decoded(TaskProgressCodec.encode(saved)).steps.single().state)
++        }
++    }
++
++    @Test
++    fun `a paused timestamp survives`() {
++        val saved = progress.copy(state = TaskState.PAUSED, pausedAtMs = 1_700_000_000_500)
++        assertEquals(1_700_000_000_500, decoded(TaskProgressCodec.encode(saved)).pausedAtMs)
++    }
++
++    @Test
++    fun `a failure message with pipes, backslashes and newlines survives`() {
++        val messy = "a|b\\c\nd\re"
++        val saved = TaskProgress(TaskState.FAILED, listOf(TaskStep("s", StepState.FAILED, failure = messy)), 1, 1)
++        val text = TaskProgressCodec.encode(saved)
++
++        assertEquals(1, text.lines().count { it.startsWith("step=") })
++        assertEquals(messy, decoded(text).steps.single().failure)
++    }
++
++    @Test
++    fun `a credential in a failure message is never written to disk`() {
++        val saved =
++            TaskProgress(
++                TaskState.FAILED,
++                listOf(TaskStep("s", StepState.FAILED, failure = "auth failed for sk-proj-abcdefghijklmnop")),
++                1,
++                1,
++            )
++        val text = TaskProgressCodec.encode(saved)
++
++        assertTrue(!text.contains("sk-proj-abcdefghijklmnop"))
++        assertTrue(text.contains("<redacted>"))
++    }
++
++    @Test
++    fun `the encoded form is a stable, readable header plus one line per step`() {
++        val lines = TaskProgressCodec.encode(progress).trimEnd('\n').split('\n')
++        assertEquals("andcode-task 1", lines[0])
++        assertEquals(5 + 3, lines.size) // header, state, attempts, startedAt, pausedAt, then one line per step
++        assertTrue(lines[1].startsWith("state=RUNNING"))
++        assertEquals(3, lines.count { it.startsWith("step=") })
++    }
++
++    @Test
++    fun `an empty file is refused`() {
++        assertEquals(DecodeRejection.EMPTY, rejection(""))
++        assertEquals(DecodeRejection.EMPTY, rejection("   \n "))
++    }
++
++    @Test
++    fun `a file without the magic header is refused`() {
++        assertEquals(DecodeRejection.BAD_HEADER, rejection("state=RUNNING\n"))
++    }
++
++    @Test
++    fun `a newer format version is refused instead of half parsed`() {
++        assertEquals(DecodeRejection.UNSUPPORTED_VERSION, rejection("andcode-task 2\nstate=RUNNING\n"))
++        assertEquals(DecodeRejection.UNSUPPORTED_VERSION, rejection("andcode-task nonsense\nstate=RUNNING\n"))
++    }
++
++    @Test
++    fun `an oversized file is refused before parsing`() {
++        val huge = "andcode-task 1\nstate=RUNNING\n" + "x".repeat(TaskProgressCodec.MAX_BYTES)
++        assertEquals(DecodeRejection.TOO_LARGE, rejection(huge))
++    }
++
++    @Test
++    fun `too many steps are refused`() {
++        val header = "andcode-task 1\nstate=RUNNING\nattempts=0\nstartedAt=1\npausedAt=\n"
++        val step = "step=s|PENDING|0|0|||\n"
++        assertEquals(DecodeRejection.TOO_MANY_STEPS, rejection(header + step.repeat(TaskProgressCodec.MAX_STEPS + 1)))
++    }
++
++    @Test
++    fun `malformed lines and values are refused`() {
++        assertEquals(DecodeRejection.MALFORMED_LINE, rejection("andcode-task 1\nstate RUNNING\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection("andcode-task 1\nstate=NOPE\nattempts=0\nstartedAt=1\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection("andcode-task 1\nstate=RUNNING\nattempts=-1\nstartedAt=1\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection("andcode-task 1\nstate=RUNNING\nattempts=x\nstartedAt=1\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection("andcode-task 1\nstate=RUNNING\nattempts=0\n"))
++    }
++
++    @Test
++    fun `a bad step line is refused with a reason`() {
++        val header = "andcode-task 1\nstate=RUNNING\nattempts=0\nstartedAt=1\n"
++        assertEquals(DecodeRejection.MALFORMED_LINE, rejection(header + "step=edit|DONE|1\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection(header + "step=edit|NOPE|1|0|||\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection(header + "step=../etc/passwd|DONE|1|0|||\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection(header + "step=edit|DONE|2|0|||\n"))
++        assertEquals(DecodeRejection.INVALID_VALUE, rejection(header + "step=edit|DONE|1|-1|||\n"))
++    }
++
++    @Test
++    fun `a duplicated step is refused`() {
++        val header = "andcode-task 1\nstate=RUNNING\nattempts=0\nstartedAt=1\n"
++        val step = "step=edit|DONE|1|1|||\n"
++        assertEquals(DecodeRejection.DUPLICATE_STEP, rejection(header + step + step))
++    }
++
++    @Test
++    fun `an unknown field is ignored and reported, not fatal`() {
++        val text = TaskProgressCodec.encode(progress).replace("state=RUNNING", "state=RUNNING\nfutureField=42")
++        val result = TaskProgressCodec.decode(text) as TaskDecodeResult.Decoded
++
++        assertEquals(TaskState.RUNNING, result.progress.state)
++        assertEquals(listOf("futureField"), result.unknownKeys)
++    }
++
++    @Test
++    fun `blank lines between records are tolerated`() {
++        val text = TaskProgressCodec.encode(progress).replace("state=RUNNING\n", "state=RUNNING\n\n")
++        assertEquals(progress, decoded(text))
++    }
++
++    @Test
++    fun `a decoded task can be resumed`() {
++        val saved =
++            TaskProgress(
++                state = TaskState.PAUSED,
++                steps = listOf(TaskStep("scan", StepState.PENDING), TaskStep("write", StepState.RUNNING, sideEffecting = true)),
++                startedAtMs = 1_000,
++            )
++        val restored = decoded(TaskProgressCodec.encode(saved))
++        val plan = TaskResume.plan(restored, now = 2_000, limits = TaskLimits()) as ResumePlan.Resumable
++
++        assertEquals(listOf("scan"), plan.stepsToRun)
++        assertEquals(listOf("write"), plan.stepsNeedingConfirmation)
++    }
++}
+diff --git a/docs/TASK_LIFECYCLE.md b/docs/TASK_LIFECYCLE.md
+index d6b0009..8e31767 100644
+--- a/docs/TASK_LIFECYCLE.md
++++ b/docs/TASK_LIFECYCLE.md
+@@ -10,9 +10,11 @@ the policy engine, the state machine, the resume rules and the check classifier
+ | `core/task/TaskRunner.kt` | `TaskRunner`, `TaskPorts`, `PlannedStep`, `TaskRequest`, `TaskRun`, `StepOutcome`, `ApprovalRequest` |
+ | `core/task/TaskReport.kt` | `StepRecord`, `TaskVerdict`, `ReportCaveat`, `TaskReport`, `TaskReportInput`, `TaskReportBuilder` |
+ | `core/task/TaskState.kt`, `TaskStateMachine.kt` | States and the transitions allowed between them (unchanged) |
+-| `core/task/TaskProgress.kt`, `TaskLimits.kt`, `TaskResume.kt` | Saved progress, hard stops, resume/confirm/cancel rules (unchanged) |
++| `core/task/TaskProgress.kt`, `TaskLimits.kt`, `TaskResume.kt` | Saved progress, hard stops, resume/confirm/cancel rules |
++| `core/task/TaskProgressCodec.kt` | The on-disk format for a saved task, and its strict reader |
+ 
+-Tests: `TaskRunnerTest` (18), `TaskReportBuilderTest` (13), `TaskStateMachineTest` (11), `TaskResumeTest` (13).
++Tests: `TaskRunnerTest` (18), `TaskReportBuilderTest` (13), `TaskProgressCodecTest` (17), `TaskStateMachineTest` (11),
++`TaskResumeTest` (13).
+ 
+ ## The order the runner follows
+ 
+@@ -71,9 +73,34 @@ classification and one-line evidence, the policy decisions from the audit log, r
+ limitations, `needsNewApk`, and the duration. `render()` is a convenience text view for a PR body or a bug
+ report; the data is the source of truth.
+ 
++## Saved format
++
++`TaskProgressCodec` is the half of "resume after the app closed" that does not need Android: a line-based
++format with a version header and one line per step.
++
++```
++andcode-task 1
++state=RUNNING
++attempts=1
++startedAt=1700000000000
++pausedAt=
++step=edit|DONE|1|1|1700000000001|1700000000002|
++```
++
++- **Hand-written, not `kotlinx.serialization`.** The format has to stay readable across app versions, must not
++  change shape when a data class gains a field, and should be diffable in a bug report.
++- **Strict reader.** An unknown field is ignored *and reported* (`unknownKeys`), but a wrong magic, a newer
++  version, an oversized file, more than 200 steps, a malformed line, a bad value or a duplicate step id are
++  all refused with a named reason - a corrupt file never half-loads.
++- **Escaped, so a message cannot break the record**: a backslash becomes `\\`, a pipe becomes `\p`, a newline
++  becomes `\n` and a carriage return `\r`. An empty timestamp column means "none"; a non-empty value that is
++  not a number is an error rather than a silent null.
++- **No secrets on disk.** The failure message is redacted on the way in *and* on the way out.
++
+ ## What is still missing
+ 
+-- **Persistence.** `TaskProgress` is plumbed through `run(previous = ...)`, but nothing writes it to disk yet.
++- **The file itself.** The codec and the `previous` plumbing exist; nothing writes the text to a file yet -
++  that is the storage change, and it needs the Android test suite to be meaningful.
+ - **The UI.** No screen calls `TaskRunner` yet; the task centre, plan sheet and report view are the next
+   change, together with the settings that produce `PolicyConfig`.
+ - **Real ports.** The three functions above have no Android implementation in this change, which is why the
+-- 
+2.39.5
+

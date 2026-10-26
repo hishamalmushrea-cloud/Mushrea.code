@@ -1,12 +1,12 @@
 # Verification transcript
-# Date: 2026-10-26T03:52:48Z
+# Date: 2026-10-26T03:59:13Z
 # Sandbox has no Android SDK, no gradle distribution and no Maven Central access, so Gradle
 # cannot run here. Instead the touched pure-Kotlin sources and the real committed JUnit test
 # sources were compiled with kotlinc (2.4.21) and executed against a minimal local stand-in for
 # the JUnit 4 API (org.junit.Test / org.junit.Assert). The test bodies are unmodified.
-# Sources are taken from a clean clone with all seven patches applied (git am).
+# Sources are taken from a clean clone with all eight patches applied (git am).
 
-$ git am 0001..0007   (fresh clone of yuga-hashimoto/and-code @ 414c780)
+$ git am 0001..0008   (fresh clone of yuga-hashimoto/and-code @ 414c780)
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
@@ -14,6 +14,7 @@ Applying: feat(memory): add a project memory that refuses secrets and mistrusts 
 Applying: feat(buildcheck): detect the project type and plan bounded, classified checks
 Applying: feat(task): build the end-of-task report with a verdict that cannot be talked up
 Applying: feat(task): add a runner that drives plan, policy, checks and report
+Applying: feat(task): add a strict, dependency-free format for a saved task
 
 $ java -version
 openjdk version "25.0.2" 2026-01-20 LTS
@@ -166,6 +167,24 @@ $ java -cp out RunnerKt
   PASS redacts the credential behind a Basic authorization header
   PASS strips oauth query parameters from urls before logging
   PASS url without a query string is returned unchanged
+== com.yugahashimoto.andcode.core.task.TaskProgressCodecTest (17 tests)
+  PASS a bad step line is refused with a reason
+  PASS a credential in a failure message is never written to disk
+  PASS a decoded task can be resumed
+  PASS a duplicated step is refused
+  PASS a failure message with pipes, backslashes and newlines survives
+  PASS a file without the magic header is refused
+  PASS a newer format version is refused instead of half parsed
+  PASS a paused timestamp survives
+  PASS a saved task round trips exactly
+  PASS an empty file is refused
+  PASS an oversized file is refused before parsing
+  PASS an unknown field is ignored and reported, not fatal
+  PASS blank lines between records are tolerated
+  PASS every state round trips
+  PASS malformed lines and values are refused
+  PASS the encoded form is a stable, readable header plus one line per step
+  PASS too many steps are refused
 == com.yugahashimoto.andcode.core.task.TaskReportBuilderTest (13 tests)
   PASS a check the environment could not run is not called broken code
   PASS a failed check is a failure and names the check
@@ -227,8 +246,11 @@ $ java -cp out RunnerKt
   PASS the full happy path is allowed
 == org.junit.Test (0 tests)
 
-RESULT passed=187 failed=0
+RESULT passed=204 failed=0
 run exit=0
 
 # Style checks the sandbox could not run through Gradle: line length / trailing whitespace / final newline
-files checked=38 issues=0
+files checked=40 issues=0
+
+$ git diff --shortstat 414c780 HEAD   (inside the clean clone)
+ 47 files changed, 6393 insertions(+)
