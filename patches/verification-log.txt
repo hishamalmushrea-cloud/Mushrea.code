@@ -1,15 +1,17 @@
 # Verification transcript
-# Date: 2026-10-25T21:15:05Z
+# Date: 2026-10-26T03:15:20Z
 # Sandbox has no Android SDK, no gradle distribution and no Maven Central access, so Gradle
 # cannot run here. Instead the touched pure-Kotlin sources and the real committed JUnit test
 # sources were compiled with kotlinc (2.4.21) and executed against a minimal local stand-in for
 # the JUnit 4 API (org.junit.Test / org.junit.Assert). The test bodies are unmodified.
-# Sources are taken from a clean clone with all three patches applied (git am).
+# Sources are taken from a clean clone with all five patches applied (git am).
 
-$ git am 0001-*.patch 0002-*.patch 0003-*.patch   (fresh clone of yuga-hashimoto/and-code @ 414c780)
+$ git am 0001..0005   (fresh clone of yuga-hashimoto/and-code @ 414c780)
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
+Applying: feat(memory): add a project memory that refuses secrets and mistrusts summaries
+Applying: feat(buildcheck): detect the project type and plan bounded, classified checks
 
 $ java -version
 openjdk version "25.0.2" 2026-01-20 LTS
@@ -20,6 +22,29 @@ $ kotlinc -jvm-target 17 <production + test sources> -d out
 compile exit=0
 
 $ java -cp out RunnerKt /tmp/out
+== com.yugahashimoto.andcode.core.buildcheck.FailureClassifierTest (9 tests)
+  PASS a compile error is a code failure
+  PASS a dependency download failure is environmental
+  PASS a failing test is a test failure
+  PASS a missing sdk is an environment failure even though the log is full of errors
+  PASS a passing check is not a failure
+  PASS a timeout is its own class and the only retryable one
+  PASS an unrecognised failure stays unknown instead of being guessed
+  PASS evidence is a single trimmed line, not the whole log
+  PASS the stored output is truncated to the command limit
+== com.yugahashimoto.andcode.core.buildcheck.ProjectDetectorTest (12 tests)
+  PASS a gradle project with an android manifest flag counts as android
+  PASS a plain gradle project is not mistaken for android
+  PASS a shell metacharacter in an argument makes the check unsafe
+  PASS an android project is detected from its manifest and gradle settings
+  PASS an executable outside the allowlist is refused
+  PASS an unrecognised workspace reports no checks and says why
+  PASS checks can be selected by category
+  PASS every generated check is safe and stays inside the limits
+  PASS node is detected and gets a typecheck only when typescript is configured
+  PASS python gets pytest only when a pytest marker exists
+  PASS rust and go are detected
+  PASS the fastest signal prefers the unit test check
 == com.yugahashimoto.andcode.core.capability.CapabilityRegistryTest (15 tests)
   PASS a capability cannot be enabled straight from a draft
   PASS a duplicate draft is refused
@@ -53,6 +78,22 @@ $ java -cp out RunnerKt /tmp/out
   PASS an unknown contract version is refused
   PASS duplicate and malformed field names are reported
   PASS limits above the hard cap are refused
+== com.yugahashimoto.andcode.core.memory.ProjectMemoryTest (15 tests)
+  PASS a credential is refused instead of stored
+  PASS a fact read from source is verified immediately
+  PASS a fact recorded at another commit is stale
+  PASS a private key block is refused
+  PASS an agent summary is never trusted on its own
+  PASS an old verification is stale even at the same commit
+  PASS constraints are recalled even when the query does not name them
+  PASS over long and empty facts are refused
+  PASS pruning drops facts from another commit and keeps current ones
+  PASS re-recording identical text refreshes, different text conflicts
+  PASS recall ranks by overlap and skips unrelated facts
+  PASS recall respects the character budget and reports what it dropped
+  PASS recording is safe to call concurrently
+  PASS the store is bounded and drops the least recently verified
+  PASS verifying a summary against the source makes it trusted
 == com.yugahashimoto.andcode.core.policy.CommandInspectorTest (12 tests)
   PASS a compound command is inspected segment by segment
   PASS a download piped into a shell is refused
@@ -151,8 +192,8 @@ $ java -cp out RunnerKt /tmp/out
   PASS the full happy path is allowed
 == org.junit.Test (0 tests)
 
-RESULT passed=120 failed=0
+RESULT passed=156 failed=0
 run exit=0
 
 # Style checks the sandbox could not run through Gradle: line length / trailing whitespace / final newline
-files checked=26 issues=0
+files checked=34 issues=0

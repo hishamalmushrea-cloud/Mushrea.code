@@ -27,8 +27,11 @@ Maven.
 ### النتيجة
 
 ```
+== core.buildcheck.FailureClassifierTest     (9 tests) ->  9 PASS
+== core.buildcheck.ProjectDetectorTest      (12 tests) -> 12 PASS
 == core.capability.CapabilityRegistryTest   (15 tests) -> 15 PASS
 == core.capability.CapabilityValidatorTest  (16 tests) -> 16 PASS
+== core.memory.ProjectMemoryTest            (15 tests) -> 15 PASS
 == core.policy.CommandInspectorTest         (12 tests) -> 12 PASS
 == core.policy.PolicyAuditLogTest            (4 tests) ->  4 PASS
 == core.policy.RiskEngineTest               (23 tests) -> 23 PASS
@@ -37,7 +40,7 @@ Maven.
 == core.task.TaskResumeTest                 (13 tests) -> 13 PASS
 == core.task.TaskStateMachineTest           (11 tests) -> 11 PASS
 
-RESULT passed=120 failed=0
+RESULT passed=156 failed=0
 ```
 
 المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّق عليها الـ patch‑ان بـ `git am`** (لا من شجرة
@@ -55,6 +58,7 @@ RESULT passed=120 failed=0
 | `writeFile` صُنِّف `UNKNOWN` بدل `WRITE_FILE` | فصل camelCase كان يستبدل المطابقة كلها بمسافة فتصبح `write ile` | الاستبدال صار `"$1 $2"` مع تعليق يشرح الخطأ |
 | قدرة من مصدر غير موثوق **لا يمكن تفعيلها أبدًا** حتى بعد المراجعة | كان `UNTRUSTED_SOURCE` يُسجَّل كعيب حاجب، فتعارض مع بوابة المراجعة في `enable()` | أُضيف `blocking` للعيب: المصدر غير الموثوق يُبلَّغ عنه ولا يمنع الانتقال؛ المنع في `enable()` |
 | معرّفات القدرات العميقة (`a.b.c.d.e.x`) كانت مقبولة | النمط سمح بخمسة مستويات | حُدّ النمط إلى أربعة مقاطع كحد أقصى |
+| حزمة `core/build` **لم تُسجَّل في Git إطلاقًا** | `.gitignore` في المستودع يتجاهل `build/` فأسقط مجلد الحزمة من `git add` | أُعيدت التسمية إلى `core/buildcheck`، وأُضيف سبب التسمية إلى `docs/BUILD_CHECKS.md` حتى لا يتكرر الفخ |
 
 ### فحوص تنسيق أُجريت يدويًا (لأن spotless غير متاح)
 
@@ -66,19 +70,23 @@ RESULT passed=120 failed=0
 
 ```
 $ git clone --depth 1 https://github.com/yuga-hashimoto/and-code.git /tmp/applycheck2
-$ git am patches/0001-*.patch patches/0002-*.patch patches/0003-*.patch
+$ git am patches/0001-*.patch ... patches/0005-*.patch
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
-$ git log --oneline -4
-0936c50 feat(capability): add a validated capability registry with a lifecycle
-03ed86c feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
-099145d feat(policy): add an in-app risk engine and task state machine
+Applying: feat(memory): add a project memory that refuses secrets and mistrusts summaries
+Applying: feat(buildcheck): detect the project type and plan bounded, classified checks
+$ git log --oneline -6
+3943f4b feat(buildcheck): detect the project type and plan bounded, classified checks
+41eac2f feat(memory): add a project memory that refuses secrets and mistrusts summaries
+dbddf0a feat(capability): add a validated capability registry with a lifecycle
+b208799 feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+e232014 feat(policy): add an in-app risk engine and task state machine
 414c780 Merge pull request #404 from yuga-hashimoto/feat/402-edit-local-workspace-files
 ```
 
-أي أن الـ patches الثلاثة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، و16 ملف إنتاج جديدًا
-موجودة بعد التطبيق، وتشغيل الاختبارات أعلاه جرى على هذه النسخة بالضبط.
+أي أن الـ patches الخمسة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، وتشغيل الاختبارات
+أعلاه جرى على هذه النسخة بالضبط (34 ملفًا فُحص تنسيقيًا: لا سطر > 140، لا مسافات زائدة).
 
 ## ما لم يُشغَّل (وهذا مذكور كقيد، لا كنجاح)
 

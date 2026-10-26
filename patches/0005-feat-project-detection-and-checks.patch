@@ -1,0 +1,816 @@
+From b9c441934402822c5c3a68810f3d356ce341401c Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 26 Oct 2026 03:15:10 +0000
+Subject: [PATCH] feat(buildcheck): detect the project type and plan bounded,
+ classified checks
+
+Fifth slice: knowing what a workspace is and whose fault a failure was, before
+any build runs.
+
+core/buildcheck (not core/build: .gitignore ignores build/, so a package with
+that name is silently skipped by git add - see docs/BUILD_CHECKS.md):
+- ProjectDetector works from the file list only (no execution, no SDK, no
+  network), so it is unit testable and honest on a phone. Android Gradle is
+  distinguished from plain Gradle by requiring both a settings file and an
+  AndroidManifest; every profile carries its evidence and an `unavailable` list
+  ("needs an Android SDK and a JDK") so the UI can say that before a build fails
+  for a reason that looks unrelated.
+- CheckCommand keeps executable and args separate and passes them as argv, never
+  through a shell; isSafe re-checks the allowlist (./gradlew, npm, npx, python3,
+  cargo, go), rejects shell metacharacters in args, and clamps the time and
+  output budgets. The detector drops unsafe checks, and a test asserts that
+  every generated check for every project type is safe.
+- FailureClassifier orders timeout -> environment -> test -> code -> unknown.
+  Environment first is the point: a missing SDK fills the log with `error:`
+  lines, so the naive order would report every setup problem as broken code.
+  Unknown stays unknown instead of being guessed; evidence is one trimmed
+  200-char line, and the stored output is cut to the command's cap.
+
+Deliberately not implemented, and said so in docs/BUILD_CHECKS.md: execution
+(that goes through the existing runtime/terminal path with core/policy in front
+of it, not a hidden ProcessBuilder in a core module), per-test report parsing,
+and any retry loop - the classifier only reports whether a retry could help.
+
+Tests: ProjectDetectorTest (12), FailureClassifierTest (9).
+---
+ .../core/buildcheck/FailureClassifier.kt      | 133 +++++++++++++
+ .../core/buildcheck/ProjectDetector.kt        | 174 ++++++++++++++++++
+ .../andcode/core/buildcheck/ProjectProfile.kt | 124 +++++++++++++
+ .../core/buildcheck/FailureClassifierTest.kt  |  92 +++++++++
+ .../core/buildcheck/ProjectDetectorTest.kt    | 132 +++++++++++++
+ docs/BUILD_CHECKS.md                          |  73 ++++++++
+ 6 files changed, 728 insertions(+)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifier.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetector.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectProfile.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifierTest.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetectorTest.kt
+ create mode 100644 docs/BUILD_CHECKS.md
+
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifier.kt b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifier.kt
+new file mode 100644
+index 0000000..7761ee1
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifier.kt
+@@ -0,0 +1,133 @@
++package com.yugahashimoto.andcode.core.buildcheck
++
++/**
++ * Sorts a failed check into [FailureClass] by the signatures its output actually contains.
++ *
++ * The ordering of the rules is the whole design: a missing Android SDK prints `error:` lines all over the
++ * log, so environment signatures have to win over code signatures, or every setup problem would be
++ * reported to the user as "your code is broken". A class the classifier cannot justify stays
++ * [FailureClass.UNKNOWN] rather than being guessed, because a wrong guess sends the next step of the task
++ * in the wrong direction.
++ *
++ * The retry hint is separate on purpose: nothing here retries, it only says whether a retry could ever help.
++ */
++object FailureClassifier {
++    data class Verdict(
++        val failureClass: FailureClass,
++        val evidence: String?,
++        /** Environment failures are not fixed by re-running; timeouts might be, once, with more room. */
++        val retryable: Boolean,
++    )
++
++    private data class Rule(
++        val failureClass: FailureClass,
++        val phrases: List<String>,
++        val retryable: Boolean,
++    )
++
++    private val RULES =
++        listOf(
++            Rule(
++                FailureClass.ENVIRONMENT,
++                listOf(
++                    "sdk location not found",
++                    "android_sdk_root",
++                    "android_home",
++                    "java_home is not set",
++                    "could not resolve all dependencies",
++                    "could not resolve",
++                    "could not download",
++                    "could not get resource",
++                    "connection refused",
++                    "network is unreachable",
++                    "temporary failure in name resolution",
++                    "no space left on device",
++                    "permission denied",
++                    "command not found",
++                    "is not recognized as an internal or external command",
++                    "unable to locate android sdk",
++                    "failed to install the following android sdk",
++                ),
++                retryable = false,
++            ),
++            Rule(
++                FailureClass.TEST,
++                listOf(
++                    "tests failed",
++                    "there were failing tests",
++                    "failed tests:",
++                    "assertionerror",
++                    "test failed",
++                    "failures!",
++                    "failed (failures=",
++                ),
++                retryable = false,
++            ),
++            Rule(
++                FailureClass.CODE,
++                listOf(
++                    "unresolved reference",
++                    "compilation error",
++                    "compilation failed",
++                    "compileerror",
++                    "syntaxerror",
++                    "e: file:",
++                    "error: ",
++                    "detekt",
++                    "spotless",
++                    "ktlint",
++                    "tsc error",
++                    "type error",
++                ),
++                retryable = false,
++            ),
++        )
++
++    fun classify(
++        exitCode: Int?,
++        timedOut: Boolean,
++        output: String,
++    ): Verdict {
++        if (timedOut) {
++            return Verdict(FailureClass.TIMEOUT, "the check exceeded its time budget", retryable = true)
++        }
++        if (exitCode == 0) return Verdict(FailureClass.UNKNOWN, null, retryable = false)
++
++        val haystack = output.lowercase()
++        for (rule in RULES) {
++            val hit = rule.phrases.firstOrNull { haystack.contains(it) }
++            if (hit != null) return Verdict(rule.failureClass, lineContaining(output, hit), rule.retryable)
++        }
++        return Verdict(FailureClass.UNKNOWN, null, retryable = false)
++    }
++
++    /** Builds the result record, so callers cannot disagree with the classifier about [CheckResult.passed]. */
++    fun result(
++        command: CheckCommand,
++        exitCode: Int?,
++        timedOut: Boolean,
++        output: String,
++    ): CheckResult {
++        val verdict = classify(exitCode, timedOut, output)
++        return CheckResult(
++            command = command,
++            exitCode = exitCode,
++            timedOut = timedOut,
++            output = output.takeLast(command.maxOutputBytes.toInt().coerceAtLeast(1)),
++            failure = if (exitCode == 0 && !timedOut) FailureClass.UNKNOWN else verdict.failureClass,
++            failureEvidence = verdict.evidence,
++        )
++    }
++
++    /** Trims the log around the matched phrase: the line itself, and never the whole build output. */
++    private fun lineContaining(
++        output: String,
++        phrase: String,
++    ): String? =
++        output.lineSequence()
++            .firstOrNull { it.lowercase().contains(phrase) }
++            ?.trim()
++            ?.take(MAX_EVIDENCE_LENGTH)
++
++    private const val MAX_EVIDENCE_LENGTH = 200
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetector.kt b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetector.kt
+new file mode 100644
+index 0000000..ed36ff0
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetector.kt
+@@ -0,0 +1,174 @@
++package com.yugahashimoto.andcode.core.buildcheck
++
++/**
++ * Works out what a workspace is and which checks make sense, from its file list alone.
++ *
++ * Deliberate limits, stated because they are the difference between a useful hint and a false promise:
++ * this does not read file contents, does not run anything, and cannot know whether the toolchain those
++ * checks need exists on this device. It reports both the evidence and the [ProjectProfile.unavailable]
++ * constraints so the task UI can say "this project needs an Android SDK this device does not have" instead
++ * of running a build that fails for an unrelated-looking reason.
++ */
++object ProjectDetector {
++    /** Files checked in order of specificity; the first matching type wins. */
++    private val MARKERS =
++        listOf(
++            ProjectType.ANDROID_GRADLE to listOf("settings.gradle.kts", "settings.gradle", "AndroidManifest.xml"),
++            ProjectType.JVM_GRADLE to listOf("build.gradle.kts", "build.gradle", "settings.gradle.kts", "settings.gradle"),
++            ProjectType.NODE to listOf("package.json"),
++            ProjectType.PYTHON to listOf("pyproject.toml", "requirements.txt", "setup.py"),
++            ProjectType.RUST to listOf("Cargo.toml"),
++            ProjectType.GO to listOf("go.mod"),
++        )
++
++    fun detect(
++        paths: List<String>,
++        hasAndroidManifest: Boolean = false,
++    ): ProjectProfile {
++        val files = paths.map { it.trim().trimStart('/') }.filter { it.isNotEmpty() }
++        val names = files.map { it.substringAfterLast('/') }.toSet()
++        val androidMarkers = files.any { it.endsWith("AndroidManifest.xml") } || hasAndroidManifest
++
++        if (androidMarkers && hasGradleSettings(names)) {
++            return profile(
++                type = ProjectType.ANDROID_GRADLE,
++                buildSystem = "gradle",
++                evidence = evidence(files, "AndroidManifest.xml", "settings.gradle.kts", "settings.gradle", "build.gradle.kts"),
++                checks = androidChecks(),
++                unavailable =
++                    listOf(
++                        "an Android SDK and JDK are required; a device without them cannot run these checks",
++                        "a release build needs a signing key, which is never handled by an automated check",
++                    ),
++            )
++        }
++        if (hasGradleSettings(names) || names.contains("build.gradle.kts") || names.contains("build.gradle")) {
++            return profile(
++                ProjectType.JVM_GRADLE,
++                "gradle",
++                evidence(files, "settings.gradle.kts", "settings.gradle", "build.gradle.kts", "build.gradle"),
++                jvmChecks(),
++                unavailable = listOf("a JDK is required"),
++            )
++        }
++        if (names.contains("package.json")) {
++            return profile(
++                ProjectType.NODE,
++                "npm",
++                evidence(files, "package.json", "tsconfig.json", "package-lock.json"),
++                nodeChecks(hasTsConfig = names.contains("tsconfig.json")),
++            )
++        }
++        if (names.any { it in setOf("pyproject.toml", "requirements.txt", "setup.py") }) {
++            return profile(
++                ProjectType.PYTHON,
++                "python",
++                evidence(files, "pyproject.toml", "requirements.txt", "setup.py"),
++                pythonChecks(hasPytestConfig = names.contains("pytest.ini") || names.contains("conftest.py")),
++            )
++        }
++        if (names.contains("Cargo.toml")) {
++            return profile(ProjectType.RUST, "cargo", evidence(files, "Cargo.toml"), rustChecks())
++        }
++        if (names.contains("go.mod")) {
++            return profile(ProjectType.GO, "go", evidence(files, "go.mod"), goChecks())
++        }
++        return ProjectProfile(
++            type = ProjectType.UNKNOWN,
++            buildSystem = "none",
++            evidence = emptyList(),
++            checks = emptyList(),
++            unavailable = listOf("no recognised build file; ask the user how this project is built"),
++        )
++    }
++
++    private fun hasGradleSettings(names: Set<String>) = names.contains("settings.gradle.kts") || names.contains("settings.gradle")
++
++    private fun evidence(
++        files: List<String>,
++        vararg markers: String,
++    ): List<String> = files.filter { file -> markers.any { file.endsWith(it) } }.take(MAX_EVIDENCE)
++
++    private fun profile(
++        type: ProjectType,
++        buildSystem: String,
++        evidence: List<String>,
++        checks: List<CheckCommand>,
++        unavailable: List<String> = emptyList(),
++    ) = ProjectProfile(type, buildSystem, evidence, checks.filter { it.isSafe }, unavailable)
++
++    private fun androidChecks() =
++        listOf(
++            CheckCommand(
++                id = "android.unit-test",
++                executable = "./gradlew",
++                args = listOf(":app:testDebugUnitTest", "--console=plain"),
++                category = CheckCategory.UNIT_TEST,
++                timeoutMs = 20L * 60L * 1000L,
++            ),
++            CheckCommand(
++                id = "android.detekt",
++                executable = "./gradlew",
++                args = listOf("detekt", "spotlessCheck", "--console=plain"),
++                category = CheckCategory.STATIC_ANALYSIS,
++                timeoutMs = 15L * 60L * 1000L,
++            ),
++            CheckCommand(
++                id = "android.assemble-debug",
++                executable = "./gradlew",
++                args = listOf(":app:assembleDebug", "--console=plain"),
++                category = CheckCategory.BUILD,
++                timeoutMs = 25L * 60L * 1000L,
++            ),
++        )
++
++    private fun jvmChecks() =
++        listOf(
++            CheckCommand("jvm.test", "./gradlew", listOf("test", "--console=plain"), CheckCategory.UNIT_TEST),
++            CheckCommand("jvm.build", "./gradlew", listOf("build", "--console=plain"), CheckCategory.BUILD),
++        )
++
++    private fun nodeChecks(hasTsConfig: Boolean): List<CheckCommand> {
++        val checks =
++            mutableListOf(
++                CheckCommand("node.test", "npm", listOf("test", "--silent"), CheckCategory.UNIT_TEST, timeoutMs = 15L * 60L * 1000L),
++            )
++        if (hasTsConfig) {
++            checks +=
++                CheckCommand("node.typecheck", "npx", listOf("tsc", "--noEmit"), CheckCategory.STATIC_ANALYSIS)
++        }
++        return checks
++    }
++
++    private fun pythonChecks(hasPytestConfig: Boolean): List<CheckCommand> {
++        val checks =
++            mutableListOf(
++                CheckCommand(
++                    "python.compile",
++                    "python3",
++                    listOf("-m", "compileall", "-q", "."),
++                    CheckCategory.STATIC_ANALYSIS,
++                    timeoutMs = 5L * 60L * 1000L,
++                ),
++            )
++        if (hasPytestConfig) {
++            checks +=
++                CheckCommand("python.pytest", "python3", listOf("-m", "pytest", "-q"), CheckCategory.UNIT_TEST)
++        }
++        return checks
++    }
++
++    private fun rustChecks() =
++        listOf(
++            CheckCommand("rust.check", "cargo", listOf("check", "--quiet"), CheckCategory.STATIC_ANALYSIS),
++            CheckCommand("rust.test", "cargo", listOf("test", "--quiet"), CheckCategory.UNIT_TEST),
++        )
++
++    private fun goChecks() =
++        listOf(
++            CheckCommand("go.vet", "go", listOf("vet", "./..."), CheckCategory.STATIC_ANALYSIS),
++            CheckCommand("go.test", "go", listOf("test", "./..."), CheckCategory.UNIT_TEST),
++        )
++
++    private const val MAX_EVIDENCE = 6
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectProfile.kt b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectProfile.kt
+new file mode 100644
+index 0000000..22efcf6
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/ProjectProfile.kt
+@@ -0,0 +1,124 @@
++package com.yugahashimoto.andcode.core.buildcheck
++
++/**
++ * What kind of project a workspace holds.
++ *
++ * Detection is filename-based on purpose: it needs no execution, no SDK and no network, so the same code
++ * runs on the phone, in a unit test and on a CI runner. It can be wrong about a project that has been
++ * reorganised in unusual ways, which is why every profile carries its [ProjectProfile.evidence] instead of
++ * just asserting a type.
++ */
++enum class ProjectType {
++    ANDROID_GRADLE,
++    JVM_GRADLE,
++    NODE,
++    PYTHON,
++    RUST,
++    GO,
++    UNKNOWN,
++    ;
++
++    /** True when the checks for this type need a toolchain the app cannot assume the device has. */
++    val needsExternalToolchain: Boolean get() = this == ANDROID_GRADLE
++}
++
++/** The classes of check the app knows how to ask for, in the order a task normally runs them. */
++enum class CheckCategory {
++    FORMAT,
++    STATIC_ANALYSIS,
++    UNIT_TEST,
++    BUILD,
++}
++
++/**
++ * One check the app is allowed to run.
++ *
++ * [executable] and [args] are separate, and args are passed as argv rather than through a shell, so a
++ * project cannot smuggle a second command in through a flag value. [CheckCommand.isSafe] re-checks that
++ * invariant because manifests and profiles are data, and data gets edited.
++ */
++data class CheckCommand(
++    val id: String,
++    val executable: String,
++    val args: List<String>,
++    val category: CheckCategory,
++    val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
++    val maxOutputBytes: Long = DEFAULT_MAX_OUTPUT_BYTES,
++) {
++    val isSafe: Boolean
++        get() = executable in ALLOWED_EXECUTABLES &&
++            args.none { arg -> SHELL_METACHARACTERS.any { arg.contains(it) } } &&
++            timeoutMs in 1..MAX_TIMEOUT_MS &&
++            maxOutputBytes in 1..MAX_OUTPUT_BYTES
++
++    /** Command line for the log and the report; safe to display because args cannot contain a separator. */
++    val display: String get() = (listOf(executable) + args).joinToString(" ")
++
++    companion object {
++        const val DEFAULT_TIMEOUT_MS = 10L * 60L * 1000L
++        const val DEFAULT_MAX_OUTPUT_BYTES = 512L * 1024L
++        const val MAX_TIMEOUT_MS = 30L * 60L * 1000L
++        const val MAX_OUTPUT_BYTES = 4L * 1024L * 1024L
++
++        /**
++         * The only executables a generated check may name. Anything else - a project script, a wrapper the
++         * repo ships, an interpreter - has to go through the task runner as an explicit operation and the
++         * policy engine, not through a generated check.
++         */
++        val ALLOWED_EXECUTABLES =
++            setOf("./gradlew", "gradlew", "npm", "npx", "python3", "python", "cargo", "go")
++
++        private val SHELL_METACHARACTERS = listOf(";", "|", "&", "$", "`", ">", "<", "\n", "\r")
++    }
++}
++
++/** The result of looking at a workspace's file list. */
++data class ProjectProfile(
++    val type: ProjectType,
++    val buildSystem: String,
++    /** Files that led to this verdict, so the user can see why. */
++    val evidence: List<String>,
++    /** Checks the app may run, already ordered and limited. */
++    val checks: List<CheckCommand>,
++    /** Things this environment cannot do, stated up front instead of discovered by a failing build. */
++    val unavailable: List<String> = emptyList(),
++) {
++    fun checksFor(categories: Set<CheckCategory>): List<CheckCommand> = checks.filter { it.category in categories }
++
++    /** The quickest check that gives a signal about whether the code even compiles. */
++    fun fastestSignal(): CheckCommand? =
++        checksFor(setOf(CheckCategory.UNIT_TEST)).firstOrNull() ?: checks.firstOrNull()
++}
++
++/** One check's result. [FailureClass] comes from [FailureClassifier], never from the model's prose. */
++data class CheckResult(
++    val command: CheckCommand,
++    val exitCode: Int?,
++    val timedOut: Boolean,
++    val output: String,
++    val failure: FailureClass,
++    val failureEvidence: String?,
++) {
++    val passed: Boolean get() = exitCode == 0 && !timedOut
++}
++
++/**
++ * What went wrong, in the three buckets a task report has to distinguish so the user is not told "your code
++ * is broken" when the device is simply missing an SDK.
++ */
++enum class FailureClass {
++    /** Toolchain, SDK, dependency download, disk or permissions. Not the project's fault. */
++    ENVIRONMENT,
++
++    /** The code did not compile or a static rule failed. */
++    CODE,
++
++    /** The code built and a test failed. */
++    TEST,
++
++    /** The check hit its time budget. */
++    TIMEOUT,
++
++    /** Nothing recognisable; reported as unknown rather than guessed. */
++    UNKNOWN,
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifierTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifierTest.kt
+new file mode 100644
+index 0000000..857fcd5
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/FailureClassifierTest.kt
+@@ -0,0 +1,92 @@
++package com.yugahashimoto.andcode.core.buildcheck
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class FailureClassifierTest {
++    private val unitTest =
++        CheckCommand(
++            id = "android.unit-test",
++            executable = "./gradlew",
++            args = listOf(":app:testDebugUnitTest"),
++            category = CheckCategory.UNIT_TEST,
++            maxOutputBytes = 100,
++        )
++
++    @Test
++    fun `a passing check is not a failure`() {
++        val result = FailureClassifier.result(unitTest, exitCode = 0, timedOut = false, output = "BUILD SUCCESSFUL")
++        assertTrue(result.passed)
++        assertEquals(null, result.failureEvidence)
++    }
++
++    @Test
++    fun `a missing sdk is an environment failure even though the log is full of errors`() {
++        val log =
++            """
++            > Task :app:compileDebugKotlin FAILED
++            e: file:///w/app/Main.kt:3:1 error: unresolved reference
++            FAILURE: Build failed with an exception.
++            * What went wrong:
++            SDK location not found. Define a valid SDK location with an ANDROID_HOME
++            """.trimIndent()
++
++        val result = FailureClassifier.result(unitTest, exitCode = 1, timedOut = false, output = log)
++        assertEquals(FailureClass.ENVIRONMENT, result.failure)
++        assertTrue(result.failureEvidence!!.contains("SDK location not found"))
++        assertFalse(FailureClassifier.classify(1, false, log).retryable)
++    }
++
++    @Test
++    fun `a dependency download failure is environmental`() {
++        val verdict =
++            FailureClassifier.classify(
++                exitCode = 1,
++                timedOut = false,
++                output = "Could not resolve all dependencies for configuration ':app:debugRuntimeClasspath'",
++            )
++        assertEquals(FailureClass.ENVIRONMENT, verdict.failureClass)
++    }
++
++    @Test
++    fun `a compile error is a code failure`() {
++        val verdict = FailureClassifier.classify(1, false, "e: file:///w/Main.kt:10:5 Unresolved reference: Foo")
++        assertEquals(FailureClass.CODE, verdict.failureClass)
++    }
++
++    @Test
++    fun `a failing test is a test failure`() {
++        val verdict = FailureClassifier.classify(1, false, "There were failing tests. See the report at: file:///w/report")
++        assertEquals(FailureClass.TEST, verdict.failureClass)
++    }
++
++    @Test
++    fun `a timeout is its own class and the only retryable one`() {
++        val verdict = FailureClassifier.classify(null, timedOut = true, output = "")
++        assertEquals(FailureClass.TIMEOUT, verdict.failureClass)
++        assertTrue(verdict.retryable)
++    }
++
++    @Test
++    fun `an unrecognised failure stays unknown instead of being guessed`() {
++        val verdict = FailureClassifier.classify(3, false, "something unexpected happened")
++        assertEquals(FailureClass.UNKNOWN, verdict.failureClass)
++        assertEquals(null, verdict.evidence)
++    }
++
++    @Test
++    fun `the stored output is truncated to the command limit`() {
++        val result = FailureClassifier.result(unitTest, exitCode = 1, timedOut = false, output = "x".repeat(500))
++        assertTrue(result.output.length <= 100)
++        assertFalse(result.passed)
++    }
++
++    @Test
++    fun `evidence is a single trimmed line, not the whole log`() {
++        val log = "line1\n   error: something broke here   \nline3"
++        val result = FailureClassifier.result(unitTest, exitCode = 1, timedOut = false, output = log)
++        assertEquals("error: something broke here", result.failureEvidence)
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetectorTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetectorTest.kt
+new file mode 100644
+index 0000000..6397c5c
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/ProjectDetectorTest.kt
+@@ -0,0 +1,132 @@
++package com.yugahashimoto.andcode.core.buildcheck
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ProjectDetectorTest {
++    @Test
++    fun `an android project is detected from its manifest and gradle settings`() {
++        val profile =
++            ProjectDetector.detect(
++                listOf(
++                    "settings.gradle.kts",
++                    "build.gradle.kts",
++                    "app/build.gradle.kts",
++                    "app/src/main/AndroidManifest.xml",
++                ),
++            )
++
++        assertEquals(ProjectType.ANDROID_GRADLE, profile.type)
++        assertEquals("gradle", profile.buildSystem)
++        assertTrue(profile.needsExternalSdkMessage())
++        assertTrue(profile.evidence.any { it.endsWith("AndroidManifest.xml") })
++        assertEquals(
++            listOf("android.unit-test", "android.detekt", "android.assemble-debug"),
++            profile.checks.map { it.id },
++        )
++    }
++
++    @Test
++    fun `a plain gradle project is not mistaken for android`() {
++        val profile = ProjectDetector.detect(listOf("settings.gradle.kts", "build.gradle.kts"))
++        assertEquals(ProjectType.JVM_GRADLE, profile.type)
++        assertFalse(profile.unavailable.any { it.contains("Android SDK") })
++    }
++
++    @Test
++    fun `a gradle project with an android manifest flag counts as android`() {
++        val profile = ProjectDetector.detect(listOf("settings.gradle", "app/build.gradle"), hasAndroidManifest = true)
++        assertEquals(ProjectType.ANDROID_GRADLE, profile.type)
++    }
++
++    @Test
++    fun `node is detected and gets a typecheck only when typescript is configured`() {
++        val plain = ProjectDetector.detect(listOf("package.json", "index.js"))
++        assertEquals(ProjectType.NODE, plain.type)
++        assertEquals(listOf("node.test"), plain.checks.map { it.id })
++
++        val typed = ProjectDetector.detect(listOf("package.json", "tsconfig.json"))
++        assertTrue(typed.checks.any { it.id == "node.typecheck" })
++    }
++
++    @Test
++    fun `python gets pytest only when a pytest marker exists`() {
++        assertEquals(listOf("python.compile"), ProjectDetector.detect(listOf("requirements.txt")).checks.map { it.id })
++        assertTrue(ProjectDetector.detect(listOf("pyproject.toml", "conftest.py")).checks.any { it.id == "python.pytest" })
++    }
++
++    @Test
++    fun `rust and go are detected`() {
++        assertEquals(ProjectType.RUST, ProjectDetector.detect(listOf("Cargo.toml", "src/main.rs")).type)
++        assertEquals(ProjectType.GO, ProjectDetector.detect(listOf("go.mod", "main.go")).type)
++    }
++
++    @Test
++    fun `an unrecognised workspace reports no checks and says why`() {
++        val profile = ProjectDetector.detect(listOf("notes.txt", "data.csv"))
++        assertEquals(ProjectType.UNKNOWN, profile.type)
++        assertTrue(profile.checks.isEmpty())
++        assertTrue(profile.unavailable.single().contains("no recognised build file"))
++    }
++
++    @Test
++    fun `every generated check is safe and stays inside the limits`() {
++        val paths =
++            listOf(
++                "settings.gradle.kts",
++                "app/src/main/AndroidManifest.xml",
++                "package.json",
++                "tsconfig.json",
++                "pyproject.toml",
++                "conftest.py",
++                "Cargo.toml",
++                "go.mod",
++            )
++        for (type in ProjectType.entries) {
++            val profile =
++                when (type) {
++                    ProjectType.ANDROID_GRADLE -> ProjectDetector.detect(paths)
++                    else -> ProjectDetector.detect(paths.filter { it != "settings.gradle.kts" && !it.contains("AndroidManifest") })
++                }
++            profile.checks.forEach { check ->
++                assertTrue("${check.id} is unsafe", check.isSafe)
++                assertTrue(check.timeoutMs <= CheckCommand.MAX_TIMEOUT_MS)
++                assertTrue(check.maxOutputBytes <= CheckCommand.MAX_OUTPUT_BYTES)
++            }
++        }
++    }
++
++    @Test
++    fun `a shell metacharacter in an argument makes the check unsafe`() {
++        val check = CheckCommand("bad", "./gradlew", listOf("test; rm -rf /"), CheckCategory.UNIT_TEST)
++        assertFalse(check.isSafe)
++        val injected = CheckCommand("bad2", "./gradlew", listOf("test", "--project-cache-dir=\$(whoami)"), CheckCategory.BUILD)
++        assertFalse(injected.isSafe)
++    }
++
++    @Test
++    fun `an executable outside the allowlist is refused`() {
++        val check = CheckCommand("custom", "./scripts/deploy.sh", emptyList(), CheckCategory.BUILD)
++        assertFalse(check.isSafe)
++        assertEquals(emptyList<CheckCommand>(), ProjectDetector.detect(listOf("package.json")).checks.filter { !it.isSafe })
++    }
++
++    @Test
++    fun `the fastest signal prefers the unit test check`() {
++        val profile = ProjectDetector.detect(listOf("settings.gradle.kts", "app/src/main/AndroidManifest.xml"))
++        assertEquals("android.unit-test", profile.fastestSignal()?.id)
++
++        val python = ProjectDetector.detect(listOf("requirements.txt"))
++        assertEquals("python.compile", python.fastestSignal()?.id)
++    }
++
++    @Test
++    fun `checks can be selected by category`() {
++        val profile = ProjectDetector.detect(listOf("Cargo.toml"))
++        assertEquals(listOf("rust.test"), profile.checksFor(setOf(CheckCategory.UNIT_TEST)).map { it.id })
++    }
++
++    private fun ProjectProfile.needsExternalSdkMessage() = unavailable.any { it.contains("Android SDK") }
++}
+diff --git a/docs/BUILD_CHECKS.md b/docs/BUILD_CHECKS.md
+new file mode 100644
+index 0000000..ba8a89c
+--- /dev/null
++++ b/docs/BUILD_CHECKS.md
+@@ -0,0 +1,73 @@
++# Project Detection & Check Planning
++
++`core/buildcheck` answers two questions before any build happens: *what is this workspace*, and *which bounded
++checks may the app run on it* - plus, after a check fails, *whose fault was it*.
++
++## Why the package is called `buildcheck`
++
++The repository's `.gitignore` ignores `build/` (the Gradle output directory, and `docs/superpowers/` too). A
++package named `core/build` is therefore silently skipped by `git add .` - which is exactly what happened
++while this change was being prepared. Renaming it to `core/buildcheck` avoids a foot-gun that would have
++looked like "my new files did not commit" to the next contributor.
++
++## Files
++
++| File | Responsibility |
++| --- | --- |
++| `ProjectProfile.kt` | `ProjectType`, `CheckCategory`, `CheckCommand` (+ `isSafe`), `ProjectProfile`, `CheckResult`, `FailureClass` |
++| `ProjectDetector.kt` | filename-based detection and the per-type check list |
++| `FailureClassifier.kt` | output → `ENVIRONMENT` / `CODE` / `TEST` / `TIMEOUT` / `UNKNOWN` |
++
++Tests: `ProjectDetectorTest` (12), `FailureClassifierTest` (9).
++
++## Detection
++
++Filename-only, in this order, first match wins: Android Gradle (a `settings.gradle(.kts)` **and** an
++`AndroidManifest.xml`) → Gradle JVM → Node (`package.json`) → Python (`pyproject.toml`/`requirements.txt`/
++`setup.py`) → Rust (`Cargo.toml`) → Go (`go.mod`) → unknown.
++
++Every profile carries its `evidence` (the files that produced the verdict) and its `unavailable` list, so
++the UI can say "this needs an Android SDK and a JDK the device may not have" *before* a build fails for a
++reason that looks unrelated. Detection never reads file contents and never executes anything, so a project
++that hides its build files in an unusual layout will be reported as `UNKNOWN` - which is the honest answer,
++and the profile says "ask the user how this project is built" rather than guessing.
++
++## Check safety
++
++`CheckCommand` keeps the executable and the arguments separate and passes them as argv, never through a
++shell. `isSafe` enforces:
++
++- the executable is one of `./gradlew`, `gradlew`, `npm`, `npx`, `python3`, `python`, `cargo`, `go`;
++- no argument contains `;`, `|`, `&`, `$`, `` ` ``, `>`, `<`, or a newline;
++- the time budget is 1 ms–30 min and the output cap 1 B–4 MiB.
++
++`ProjectDetector` filters unsafe checks out entirely, and the test suite asserts that every generated check
++for every project type is safe - so a future edit that adds a clever `sh -c` line fails a test rather than
++shipping.
++
++## Failure classification
++
++Rules are checked in this order, deliberately:
++
++1. **timeout** - the only retryable class;
++2. **environment** - missing SDK/`ANDROID_HOME`, unresolvable dependencies, network, disk, permissions,
++   `command not found`;
++3. **test** - "There were failing tests", assertion failures;
++4. **code** - `Unresolved reference`, `error:`, ktlint/detekt/spotless, TypeScript errors;
++5. otherwise **unknown**, with no evidence invented.
++
++Environment before code is the point: a missing SDK prints `error:` lines throughout the log, so the naive
++ordering would report every setup problem as "your code is broken" and send the next task step in the wrong
++direction. `CheckResult.failureEvidence` is one trimmed line around the match, capped at 200 characters, and
++`output` itself is truncated to the command's `maxOutputBytes`.
++
++## What is not implemented
++
++Execution. `CheckCommand` describes a bounded command; running it requires the device's process facilities,
++which in this app means going through the existing runtime/terminal path with the policy engine in front of
++it (`core/policy`), not a new `ProcessBuilder` hidden inside a core module. That integration is the next
++change, and this document says so instead of implying a build runner exists.
++
++Also not implemented: parsing test reports into per-test results (only the class of failure is derived), and
++any retry loop - `FailureClassifier` reports whether a retry *could* help, `core/task` decides whether to
++spend one.
+-- 
+2.39.5
+

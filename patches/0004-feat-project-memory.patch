@@ -1,0 +1,694 @@
+From 53a0c20d6f4935fb82c501214e377202ead733c1 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 26 Oct 2026 03:14:31 +0000
+Subject: [PATCH] feat(memory): add a project memory that refuses secrets and
+ mistrusts summaries
+
+Fourth slice: the engineering memory from the task, minus its persistence.
+
+core/memory:
+- MemoryFact carries its source (SOURCE_CODE / BUILD_OUTPUT / USER / REPO_DOC /
+  AGENT_SUMMARY), the commit it was true of, and when it was verified. Both
+  facts are needed: the commit says what it was true of, the clock says how
+  long ago.
+- A fact from AGENT_SUMMARY is always returned with needsVerification = true
+  until markVerified() is called against the current head - a model's summary
+  is a pointer to look somewhere, not an answer.
+- A fact whose commit no longer matches the head, or whose verification is
+  older than the age limit, is returned as unverified with the reason ("recorded
+  at 414c780, head is 1a8a67a", "verified 15 days ago").
+- Every fact is screened with the same SecretRedaction patterns the crash
+  reporter uses plus a private-key header check, and refused outright rather
+  than stored scrubbed; the rejection never names the matched pattern.
+- record() refuses different text under an existing id, so a decision is not
+  silently overwritten.
+- recall() ranks by keyword overlap and stops at a character budget, reporting
+  how many facts it omitted; CONSTRAINT facts are always included because the
+  rules that must not be broken are worth the space.
+- Bounded (400 facts) and thread safe.
+
+docs/PROJECT_MEMORY.md also states the split the task asks for: reviewable
+architectural knowledge lives in tracked markdown, operational facts here.
+
+Tests: ProjectMemoryTest (15).
+---
+ README.md                                     |   2 +
+ .../andcode/core/memory/MemoryFact.kt         | 135 ++++++++++
+ .../andcode/core/memory/ProjectMemory.kt      | 242 ++++++++++++++++++
+ .../andcode/core/memory/ProjectMemoryTest.kt  | 168 ++++++++++++
+ docs/PROJECT_MEMORY.md                        |  64 +++++
+ 5 files changed, 611 insertions(+)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/memory/MemoryFact.kt
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/memory/ProjectMemory.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/memory/ProjectMemoryTest.kt
+ create mode 100644 docs/PROJECT_MEMORY.md
+
+diff --git a/README.md b/README.md
+index 6ea79df..93ac9e9 100644
+--- a/README.md
++++ b/README.md
+@@ -255,6 +255,8 @@ adb install -r app/build/outputs/apk/github/debug/app-github-debug.apk
+ - [Device Validation Matrix](docs/device-matrix.md)
+ - [Policy & Risk Engine](docs/POLICY_ENGINE.md)
+ - [Capability System](docs/CAPABILITY_SYSTEM.md)
++- [Project Memory](docs/PROJECT_MEMORY.md)
++- [Project Detection & Check Planning](docs/BUILD_CHECKS.md)
+ 
+ ## Contributing
+ 
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/memory/MemoryFact.kt b/app/src/main/java/com/yugahashimoto/andcode/core/memory/MemoryFact.kt
+new file mode 100644
+index 0000000..744c9a3
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/memory/MemoryFact.kt
+@@ -0,0 +1,135 @@
++package com.yugahashimoto.andcode.core.memory
++
++/**
++ * Where a fact came from, which decides how much it can be trusted before it is used again.
++ *
++ * The ordering matters more than the list: a fact read out of the source tree today outranks anything a
++ * model wrote about that tree in a previous session, and the task is explicit that a summary is not a
++ * substitute for checking the current source.
++ */
++enum class FactSource {
++    /** Read from the checked-out source. Re-cheap to re-verify, so it ages quickly but safely. */
++    SOURCE_CODE,
++
++    /** Produced by an actual build or test run. */
++    BUILD_OUTPUT,
++
++    /** Stated by the user. */
++    USER,
++
++    /** Documented in a tracked file (README, ADR, this repo's docs). Reviewable in Git. */
++    REPO_DOC,
++
++    /**
++     * Written by an agent from memory or summary. Never treated as verified on its own - it is a hint
++     * that says "look here", not an answer.
++     */
++    AGENT_SUMMARY,
++    ;
++
++    /** Only these can be trusted without a fresh look at the code. */
++    val selfVerifying: Boolean get() = this != AGENT_SUMMARY
++}
++
++/** What the fact is about, so retrieval can be scoped instead of dumping everything. */
++enum class FactKind {
++    MODULE_MAP,
++    DEPENDENCY,
++    BUILD_COMMAND,
++    TEST_COMMAND,
++    ARCHITECTURE_DECISION,
++    KNOWN_ISSUE,
++    CONSTRAINT,
++    RECENT_CHANGE,
++    FEATURE_STATUS,
++}
++
++/**
++ * One engineering fact about the project.
++ *
++ * [commitRef] and [recordedAtMs] are both kept: the commit says *what* the fact was true of, the clock
++ * says how long ago that was. A fact with neither cannot be judged, so [record] refuses it.
++ */
++data class MemoryFact(
++    val id: String,
++    val kind: FactKind,
++    val source: FactSource,
++    val text: String,
++    val recordedAtMs: Long,
++    val commitRef: String? = null,
++    val verifiedAtMs: Long? = null,
++    /** Free-form tags used by retrieval; lowercased on construction. */
++    val tags: Set<String> = emptySet(),
++) {
++    val isVerified: Boolean get() = verifiedAtMs != null
++
++    /** True when this fact may be repeated to a user or used for a decision without checking again. */
++    fun trustedAt(
++        nowMs: Long,
++        currentCommit: String?,
++        maxAgeMs: Long,
++    ): Boolean {
++        if (source == FactSource.AGENT_SUMMARY) return false
++        if (currentCommit != null && commitRef != null && commitRef != currentCommit) return false
++        val verified = verifiedAtMs ?: return false
++        return nowMs - verified <= maxAgeMs
++    }
++}
++
++/** A fact as handed to the caller, with the reason it may not be usable yet. */
++data class RetrievedFact(
++    val fact: MemoryFact,
++    val needsVerification: Boolean,
++    val reason: String,
++) {
++    /** What to show: the text, plus a marker when it still has to be checked. */
++    fun render(): String = if (needsVerification) "${fact.text} [unverified: $reason]" else fact.text
++}
++
++/** Result of a retrieval: bounded, ranked, and explicit about what was left out. */
++data class MemoryRetrieval(
++    val facts: List<RetrievedFact>,
++    val omittedCount: Int,
++    val usedChars: Int,
++) {
++    val allVerified: Boolean get() = facts.none { it.needsVerification }
++}
++
++/** Why a fact was refused at write time. */
++enum class MemoryRejection {
++    /** The text matched a credential pattern; secrets never enter the project memory. */
++    CONTAINS_SECRET,
++
++    /** Longer than [MemoryLimits.maxFactChars]; a wall of text is not a fact. */
++    TOO_LONG,
++
++    /** Empty or blank. */
++    EMPTY,
++
++    /** Duplicate id with different content, so the caller has to decide explicitly. */
++    ID_CONFLICT,
++}
++
++/** Limits that keep the memory useful instead of becoming a second copy of the repo. */
++data class MemoryLimits(
++    val maxFacts: Int = DEFAULT_MAX_FACTS,
++    val maxFactChars: Int = DEFAULT_MAX_FACT_CHARS,
++    val maxRetrievalChars: Int = DEFAULT_MAX_RETRIEVAL_CHARS,
++    /** After this long, even a verified fact has to be looked at again. */
++    val maxAgeMs: Long = DEFAULT_MAX_AGE_MS,
++) {
++    init {
++        require(maxFacts > 0) { "maxFacts must be positive" }
++        require(maxFactChars > 0) { "maxFactChars must be positive" }
++        require(maxRetrievalChars > 0) { "maxRetrievalChars must be positive" }
++        require(maxAgeMs > 0) { "maxAgeMs must be positive" }
++    }
++
++    companion object {
++        const val DEFAULT_MAX_FACTS = 400
++        const val DEFAULT_MAX_FACT_CHARS = 400
++        const val DEFAULT_MAX_RETRIEVAL_CHARS = 4_000
++        /** Two weeks: long enough to be useful across sessions, short enough to be re-checked. */
++        const val DEFAULT_MAX_AGE_MS = 14L * 24L * 60L * 60L * 1000L
++    }
++}
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/memory/ProjectMemory.kt b/app/src/main/java/com/yugahashimoto/andcode/core/memory/ProjectMemory.kt
+new file mode 100644
+index 0000000..595c9bb
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/memory/ProjectMemory.kt
+@@ -0,0 +1,242 @@
++package com.yugahashimoto.andcode.core.memory
++
++import com.yugahashimoto.andcode.core.security.SecretRedaction
++
++/** Outcome of writing a fact. */
++sealed interface MemoryWriteResult {
++    data class Stored(val fact: MemoryFact) : MemoryWriteResult
++
++    data class Rejected(
++        val reason: MemoryRejection,
++        val detail: String,
++    ) : MemoryWriteResult
++
++    val accepted: Boolean get() = this is Stored
++}
++
++/**
++ * The project's engineering memory.
++ *
++ * Three rules from the task are enforced here rather than hoped for:
++ *
++ * 1. **No secrets.** Every fact is screened before it is stored, using the same [SecretRedaction]
++ *    patterns the crash reporter uses; a fact whose text contains a credential is refused, not scrubbed,
++ *    because a partially redacted credential is still a leak waiting for the next regex gap.
++ * 2. **A summary is not the source.** Facts from [FactSource.AGENT_SUMMARY] are always returned as
++ *    unverified; facts from the code or a build are only trusted while their commit and age still match.
++ * 3. **Relevant context only.** [recall] ranks and truncates to a character budget instead of sending the
++ *    whole memory, and says how many facts it left out.
++ *
++ * In-memory for now: architectural knowledge that belongs in Git stays in Git, and the operational store
++ * is a separate change. Nothing here persists across process death yet.
++ */
++class ProjectMemory(
++    private val limits: MemoryLimits = MemoryLimits(),
++    private val clock: () -> Long = { System.currentTimeMillis() },
++) {
++    private val lock = Any()
++    private val facts = linkedMapOf<String, MemoryFact>()
++
++    /**
++     * Records a fact. Re-recording the same id with identical text refreshes its verification instead of
++     * duplicating it; different text under the same id is refused so the caller has to be explicit.
++     */
++    fun record(
++        id: String,
++        kind: FactKind,
++        source: FactSource,
++        text: String,
++        commitRef: String? = null,
++        tags: Set<String> = emptySet(),
++    ): MemoryWriteResult {
++        val trimmed = text.trim()
++        if (trimmed.isEmpty()) return MemoryWriteResult.Rejected(MemoryRejection.EMPTY, id)
++        if (trimmed.length > limits.maxFactChars) {
++            return MemoryWriteResult.Rejected(
++                MemoryRejection.TOO_LONG,
++                "${trimmed.length} > ${limits.maxFactChars} characters",
++            )
++        }
++        if (looksLikeSecret(trimmed)) {
++            // Deliberately silent about which pattern matched: saying so would echo the secret back.
++            return MemoryWriteResult.Rejected(MemoryRejection.CONTAINS_SECRET, "fact text contains a credential")
++        }
++
++        synchronized(lock) {
++            val existing = facts[id]
++            if (existing != null && existing.text != trimmed) {
++                return MemoryWriteResult.Rejected(MemoryRejection.ID_CONFLICT, "id '$id' already holds different text")
++            }
++            val now = clock()
++            val fact =
++                MemoryFact(
++                    id = id,
++                    kind = kind,
++                    source = source,
++                    text = trimmed,
++                    recordedAtMs = existing?.recordedAtMs ?: now,
++                    commitRef = commitRef ?: existing?.commitRef,
++                    verifiedAtMs = if (source.selfVerifying) now else null,
++                    tags = tags.map { it.lowercase() }.toSet(),
++                )
++            store(fact)
++            return MemoryWriteResult.Stored(fact)
++        }
++    }
++
++    /** Marks a fact as checked against the current source. The only way a summary becomes trusted. */
++    fun markVerified(
++        id: String,
++        currentCommit: String?,
++    ): MemoryWriteResult =
++        synchronized(lock) {
++            val existing = facts[id] ?: return MemoryWriteResult.Rejected(MemoryRejection.ID_CONFLICT, "unknown id '$id'")
++            val refreshed = existing.copy(verifiedAtMs = clock(), commitRef = currentCommit ?: existing.commitRef)
++            store(refreshed)
++            MemoryWriteResult.Stored(refreshed)
++        }
++
++    /** Returns a fact with its verdict, without going through ranking. */
++    fun get(
++        id: String,
++        nowMs: Long = clock(),
++        currentCommit: String? = null,
++    ): RetrievedFact? {
++        val fact = synchronized(lock) { facts[id] } ?: return null
++        return judge(fact, nowMs, currentCommit)
++    }
++
++    /**
++     * Selects the facts relevant to [query], best first, until the character budget runs out.
++     *
++     * Scoring is keyword overlap over the text and tags; a fact that matches nothing is only included when
++     * it is a `CONSTRAINT` (the rules an agent must not break are worth the space even when the query does
++     * not name them).
++     */
++    fun recall(
++        query: String,
++        kind: FactKind? = null,
++        nowMs: Long = clock(),
++        currentCommit: String? = null,
++    ): MemoryRetrieval {
++        val terms = tokenise(query)
++        val candidates =
++            synchronized(lock) {
++                facts.values.filter { kind == null || it.kind == kind }
++            }
++
++        val scored =
++            candidates.mapNotNull { fact ->
++                val score = score(fact, terms)
++                when {
++                    score > 0 -> fact to score
++                    fact.kind == FactKind.CONSTRAINT -> fact to 1
++                    else -> null
++                }
++            }.sortedWith(compareByDescending<Pair<MemoryFact, Int>> { it.second }.thenByDescending { it.first.verifiedAtMs ?: 0 })
++
++        val selected = mutableListOf<RetrievedFact>()
++        var used = 0
++        var omitted = 0
++        for ((fact, _) in scored) {
++            val candidate = judge(fact, nowMs, currentCommit)
++            val cost = candidate.fact.text.length
++            if (used + cost > limits.maxRetrievalChars) {
++                omitted++
++                continue
++            }
++            selected += candidate
++            used += cost
++        }
++        return MemoryRetrieval(selected, omitted + (candidates.size - scored.size), used)
++    }
++
++    fun size(): Int = synchronized(lock) { facts.size }
++
++    fun snapshot(): List<MemoryFact> = synchronized(lock) { facts.values.toList() }
++
++    /** Drops facts whose commit no longer matches or that are older than the limit. */
++    fun pruneStale(
++        currentCommit: String?,
++        nowMs: Long = clock(),
++    ): Int =
++        synchronized(lock) {
++            val before = facts.size
++            facts.entries.removeAll { (_, fact) ->
++                val wrongCommit = currentCommit != null && fact.commitRef != null && fact.commitRef != currentCommit
++                val tooOld = nowMs - (fact.verifiedAtMs ?: fact.recordedAtMs) > limits.maxAgeMs
++                wrongCommit || tooOld
++            }
++            before - facts.size
++        }
++
++    private fun store(fact: MemoryFact) {
++        facts[fact.id] = fact
++        // Oldest unverified facts go first: they are the least useful thing to keep.
++        while (facts.size > limits.maxFacts) {
++            val victim =
++                facts.values.minWithOrNull(
++                    compareBy<MemoryFact> { it.verifiedAtMs ?: it.recordedAtMs }.thenBy { it.id },
++                ) ?: break
++            facts.remove(victim.id)
++        }
++    }
++
++    private fun judge(
++        fact: MemoryFact,
++        nowMs: Long,
++        currentCommit: String?,
++    ): RetrievedFact =
++        when {
++            fact.source == FactSource.AGENT_SUMMARY && !fact.isVerified ->
++                RetrievedFact(fact, needsVerification = true, reason = "agent summary, not checked against the source")
++            fact.commitRef != null && currentCommit != null && fact.commitRef != currentCommit ->
++                RetrievedFact(
++                    fact,
++                    needsVerification = true,
++                    reason = "recorded at ${fact.commitRef.take(7)}, head is ${currentCommit.take(7)}",
++                )
++            fact.verifiedAtMs == null ->
++                RetrievedFact(fact, needsVerification = true, reason = "never verified")
++            nowMs - fact.verifiedAtMs > limits.maxAgeMs ->
++                RetrievedFact(
++                    fact,
++                    needsVerification = true,
++                    reason = "verified ${(nowMs - fact.verifiedAtMs) / DAY_MS} days ago",
++                )
++            else ->
++                RetrievedFact(
++                    fact,
++                    needsVerification = false,
++                    reason = "verified at ${fact.commitRef?.take(7) ?: "current head"}",
++                )
++        }
++
++    private fun score(
++        fact: MemoryFact,
++        terms: Set<String>,
++    ): Int {
++        if (terms.isEmpty()) return 0
++        val haystack = (fact.text + " " + fact.tags.joinToString(" ")).lowercase()
++        return terms.count { haystack.contains(it) }
++    }
++
++    private fun tokenise(query: String): Set<String> =
++        query.lowercase()
++            .split(NON_WORD)
++            .filter { it.length >= 3 && it !in STOP_WORDS }
++            .toSet()
++
++    private fun looksLikeSecret(text: String): Boolean {
++        // If redaction changes the text, something in it looked like a credential.
++        if (SecretRedaction.redact(text) != text) return true
++        return PRIVATE_KEY_HEADER.containsMatchIn(text)
++    }
++
++    private companion object {
++        const val DAY_MS = 24L * 60L * 60L * 1000L
++        val NON_WORD = Regex("[^a-z0-9_.\\-/]+")
++        val PRIVATE_KEY_HEADER = Regex("-----BEGIN [A-Z ]*PRIVATE KEY-----")
++        val STOP_WORDS = setOf("the", "and", "for", "with", "that", "this", "from", "what", "how", "why", "does", "are", "was")
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/memory/ProjectMemoryTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/memory/ProjectMemoryTest.kt
+new file mode 100644
+index 0000000..8301528
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/memory/ProjectMemoryTest.kt
+@@ -0,0 +1,168 @@
++package com.yugahashimoto.andcode.core.memory
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ProjectMemoryTest {
++    private val now = 1_700_000_000_000L
++    private val head = "414c780abcdef"
++
++    private fun memory(limits: MemoryLimits = MemoryLimits()) = ProjectMemory(limits) { now }
++
++    private fun ProjectMemory.put(
++        id: String,
++        text: String,
++        kind: FactKind = FactKind.MODULE_MAP,
++        source: FactSource = FactSource.SOURCE_CODE,
++        commit: String? = head,
++        tags: Set<String> = emptySet(),
++    ) = record(id, kind, source, text, commit, tags)
++
++    @Test
++    fun `a fact read from source is verified immediately`() {
++        val memory = memory()
++        val stored = memory.put("modules.chat", "chat lives in feature/chat") as MemoryWriteResult.Stored
++        assertTrue(stored.fact.isVerified)
++
++        val retrieved = memory.get("modules.chat", now, head)!!
++        assertFalse(retrieved.needsVerification)
++    }
++
++    @Test
++    fun `an agent summary is never trusted on its own`() {
++        val memory = memory()
++        memory.put("mods", "the app is probably a single Gradle module", source = FactSource.AGENT_SUMMARY)
++
++        val retrieved = memory.get("mods", now, head)!!
++        assertTrue(retrieved.needsVerification)
++        assertTrue(retrieved.render().contains("unverified"))
++    }
++
++    @Test
++    fun `verifying a summary against the source makes it trusted`() {
++        val memory = memory()
++        memory.put("mods", "single Gradle module", source = FactSource.AGENT_SUMMARY)
++        memory.markVerified("mods", head)
++
++        assertFalse(memory.get("mods", now, head)!!.needsVerification)
++    }
++
++    @Test
++    fun `a fact recorded at another commit is stale`() {
++        val memory = memory()
++        memory.put("mods", "module layout", commit = "oldcommit")
++
++        val retrieved = memory.get("mods", now, head)!!
++        assertTrue(retrieved.needsVerification)
++        assertTrue(retrieved.reason.contains("head is"))
++    }
++
++    @Test
++    fun `an old verification is stale even at the same commit`() {
++        val memory = memory()
++        memory.put("mods", "module layout")
++        val later = now + MemoryLimits.DEFAULT_MAX_AGE_MS + 1
++
++        assertTrue(memory.get("mods", later, head)!!.needsVerification)
++    }
++
++    @Test
++    fun `a credential is refused instead of stored`() {
++        val memory = memory()
++        val result = memory.record("secret", FactKind.CONSTRAINT, FactSource.USER, "deploy uses sk-proj-abcdefghijklmnop")
++        assertEquals(MemoryRejection.CONTAINS_SECRET, (result as MemoryWriteResult.Rejected).reason)
++        assertEquals(0, memory.size())
++    }
++
++    @Test
++    fun `a private key block is refused`() {
++        val memory = memory()
++        val result = memory.record("key", FactKind.CONSTRAINT, FactSource.USER, "-----BEGIN RSA PRIVATE KEY-----")
++        assertEquals(MemoryRejection.CONTAINS_SECRET, (result as MemoryWriteResult.Rejected).reason)
++    }
++
++    @Test
++    fun `over long and empty facts are refused`() {
++        val memory = memory(MemoryLimits(maxFactChars = 20))
++        assertEquals(MemoryRejection.TOO_LONG, (memory.put("long", "x".repeat(21)) as MemoryWriteResult.Rejected).reason)
++        assertEquals(MemoryRejection.EMPTY, (memory.put("empty", "   ") as MemoryWriteResult.Rejected).reason)
++    }
++
++    @Test
++    fun `re-recording identical text refreshes, different text conflicts`() {
++        val memory = memory()
++        memory.put("mods", "single module")
++        assertTrue(memory.put("mods", "single module").accepted)
++
++        val conflict = memory.put("mods", "actually two modules")
++        assertEquals(MemoryRejection.ID_CONFLICT, (conflict as MemoryWriteResult.Rejected).reason)
++        assertEquals(1, memory.size())
++    }
++
++    @Test
++    fun `recall ranks by overlap and skips unrelated facts`() {
++        val memory = memory()
++        memory.put("chat", "chat streaming lives in ChatViewModel", tags = setOf("chat", "streaming"))
++        memory.put("build", "gradle wrapper is 8.9")
++        memory.put("rust", "no rust in this project")
++
++        val retrieval = memory.recall("how does chat streaming work", null, now, head)
++        assertEquals("chat", retrieval.facts.first().fact.id)
++        assertFalse(retrieval.facts.any { it.fact.id == "rust" })
++    }
++
++    @Test
++    fun `constraints are recalled even when the query does not name them`() {
++        val memory = memory()
++        memory.put("no-flutter", "never add Flutter or NDK", kind = FactKind.CONSTRAINT)
++
++        val retrieval = memory.recall("why does the build fail", null, now, head)
++        assertTrue(retrieval.facts.any { it.fact.id == "no-flutter" })
++    }
++
++    @Test
++    fun `recall respects the character budget and reports what it dropped`() {
++        val memory = memory(MemoryLimits(maxRetrievalChars = 40))
++        repeat(4) { index -> memory.put("fact$index", "gradle module $index detail") }
++
++        val retrieval = memory.recall("gradle module", null, now, head)
++        assertTrue(retrieval.usedChars <= 40)
++        assertTrue(retrieval.omittedCount > 0)
++    }
++
++    @Test
++    fun `pruning drops facts from another commit and keeps current ones`() {
++        val memory = memory()
++        memory.put("old", "from an old commit", commit = "old")
++        memory.put("new", "from head", commit = head)
++
++        assertEquals(1, memory.pruneStale(head, now))
++        assertEquals(listOf("new"), memory.snapshot().map { it.id })
++    }
++
++    @Test
++    fun `the store is bounded and drops the least recently verified`() {
++        val memory = memory(MemoryLimits(maxFacts = 2))
++        memory.put("a", "first fact")
++        memory.put("b", "second fact")
++        memory.put("c", "third fact")
++
++        assertEquals(2, memory.size())
++        assertFalse(memory.snapshot().any { it.id == "a" })
++    }
++
++    @Test
++    fun `recording is safe to call concurrently`() {
++        val memory = memory()
++        val threads =
++            (0 until 8).map { index ->
++                Thread { memory.put("f$index", "gradle detail $index") }
++            }
++        threads.forEach { it.start() }
++        threads.forEach { it.join() }
++
++        assertEquals(8, memory.size())
++    }
++}
+diff --git a/docs/PROJECT_MEMORY.md b/docs/PROJECT_MEMORY.md
+new file mode 100644
+index 0000000..b7297c7
+--- /dev/null
++++ b/docs/PROJECT_MEMORY.md
+@@ -0,0 +1,64 @@
++# Project Memory
++
++`core/memory` keeps the engineering facts an agent needs between sessions, without becoming a second,
++staler copy of the repository. It is the answer to the task's section 6: record what the project *is*, tie
++each fact to when and where it was true, and never let a model's summary stand in for looking at the code.
++
++## Files
++
++| File | Responsibility |
++| --- | --- |
++| `MemoryFact.kt` | `MemoryFact`, `FactSource`, `FactKind`, `MemoryLimits`, retrieval result types |
++| `ProjectMemory.kt` | `record` / `markVerified` / `recall` / `pruneStale` |
++
++Tests: `ProjectMemoryTest` (15).
++
++## The three rules, in code
++
++**1. No secrets.** Every fact is screened with the same `core.security.SecretRedaction` patterns the crash
++reporter uses, plus a private-key header check. A fact whose text contains a credential is *refused*, not
++scrubbed - a partially redacted key is still a leak waiting for the next regex gap. The rejection does not
++say which pattern matched, because that would echo the secret back into the log.
++
++**2. A summary is not the source.** `FactSource.AGENT_SUMMARY` facts are always returned with
++`needsVerification = true` until `markVerified()` is called with the current commit. Facts from
++`SOURCE_CODE`, `BUILD_OUTPUT`, `USER` and `REPO_DOC` are trusted only while both conditions hold:
++
++- their `commitRef` still equals the current head;
++- they were verified within `MemoryLimits.maxAgeMs` (default 14 days).
++
++A fact that fails either check comes back with the reason ("recorded at 414c780, head is 1a8a67a",
++"verified 15 days ago"), so the caller can show it as a hint instead of an answer.
++
++**3. Relevant context only.** `recall(query)` scores facts by keyword overlap with the query over text and
++tags, sorts best-first, and stops at a character budget (4,000 by default). It returns `omittedCount`, so a
++caller can say "3 more facts not shown" instead of silently pretending the memory is complete. `CONSTRAINT`
++facts are always included regardless of the query: the rules an agent must not break are worth the space
++even when the question does not name them.
++
++## Decisions
++
++- **`record` refuses conflicting text under the same id.** Re-recording identical text refreshes it;
++  different text under an existing id is an `ID_CONFLICT`, so a decision is never silently overwritten.
++  This is what "update the memory after an important change" has to mean to stay auditable.
++- **`pruneStale` is explicit.** It drops facts from another commit or past the age limit and returns how
++  many went, rather than letting stale facts rot in the store.
++- **Bounded.** 400 facts, 400 characters per fact; the oldest unverified fact is evicted first.
++- **Thread-safe.** `record`/`recall` are called from the task runner and the UI; the test suite writes from
++  eight threads at once.
++
++## What this is not
++
++- Not persisted yet, and not in Git: the rule from the task is that *architectural knowledge people should
++  review* belongs in tracked Markdown (`docs/*.md`, ADRs), while operational facts belong in app storage.
++  This class is the operational half; the tracked half is the documentation you are reading.
++- It does not read the repository by itself; a caller (the future task runner) feeds it facts.
++- It does not decide anything. It hands out facts plus their trust status; `core/policy` and
++  `core/task` decide what may happen.
++
++## Wiring it in (next)
++
++1. On task start, `recall(taskDescription, currentCommit = head, now = now)` and put the result in the
++   agent context - replacing the current "send whatever we remember" behaviour.
++2. After a build or test run, `record` the outcome with `FactSource.BUILD_OUTPUT` and the current commit.
++3. On merge, `pruneStale(newHead)`.
+-- 
+2.39.5
+
