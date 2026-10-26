@@ -1,12 +1,12 @@
 # Verification transcript
-# Date: 2026-10-26T03:59:13Z
+# Date: 2026-10-26T04:04:33Z
 # Sandbox has no Android SDK, no gradle distribution and no Maven Central access, so Gradle
 # cannot run here. Instead the touched pure-Kotlin sources and the real committed JUnit test
 # sources were compiled with kotlinc (2.4.21) and executed against a minimal local stand-in for
 # the JUnit 4 API (org.junit.Test / org.junit.Assert). The test bodies are unmodified.
-# Sources are taken from a clean clone with all eight patches applied (git am).
+# Sources are taken from a clean clone with all nine patches applied (git am).
 
-$ git am 0001..0008   (fresh clone of yuga-hashimoto/and-code @ 414c780)
+$ git am 0001..0009   (fresh clone of yuga-hashimoto/and-code @ 414c780)
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
@@ -15,6 +15,7 @@ Applying: feat(buildcheck): detect the project type and plan bounded, classified
 Applying: feat(task): build the end-of-task report with a verdict that cannot be talked up
 Applying: feat(task): add a runner that drives plan, policy, checks and report
 Applying: feat(task): add a strict, dependency-free format for a saved task
+Applying: feat(buildcheck): read per-test results out of a check's output
 
 $ java -version
 openjdk version "25.0.2" 2026-01-20 LTS
@@ -48,6 +49,25 @@ $ java -cp out RunnerKt
   PASS python gets pytest only when a pytest marker exists
   PASS rust and go are detected
   PASS the fastest signal prefers the unit test check
+== com.yugahashimoto.andcode.core.buildcheck.TestReportParserTest (18 tests)
+  PASS Gradle's per-test console lines are read with the first line of the trace
+  PASS XML totals win when the output was cut and fewer cases survived
+  PASS a JUnit XML report gives totals and names the failing test
+  PASS a check carries its own report without re-running anything
+  PASS a credential in a failure message never reaches the report
+  PASS a failed-only summary is read as failures rather than inventing passes
+  PASS a long test name is bounded so one report line cannot be unbounded
+  PASS a passing check with no report is still no evidence
+  PASS a stack trace is flattened into one bounded line
+  PASS a successful build with no test report claims nothing
+  PASS a summary line alone gives the counts but no names
+  PASS a truncated log tail is still parsed
+  PASS an XML error counts as a failure
+  PASS an XML failure message is unescaped so it reads like the assertion
+  PASS an XML suite with no tests is evidence of zero tests, not a pass
+  PASS blank output is not a pass
+  PASS console lines without a summary still give honest totals
+  PASS the failure list is capped and says so
 == com.yugahashimoto.andcode.core.capability.CapabilityRegistryTest (15 tests)
   PASS a capability cannot be enabled straight from a draft
   PASS a duplicate draft is refused
@@ -185,10 +205,12 @@ $ java -cp out RunnerKt
   PASS malformed lines and values are refused
   PASS the encoded form is a stable, readable header plus one line per step
   PASS too many steps are refused
-== com.yugahashimoto.andcode.core.task.TaskReportBuilderTest (13 tests)
+== com.yugahashimoto.andcode.core.task.TaskReportBuilderTest (15 tests)
   PASS a check the environment could not run is not called broken code
+  PASS a check with no recognisable test report adds no test lines
   PASS a failed check is a failure and names the check
   PASS a failed step is a failure even if the checks passed
+  PASS a failing check's report names the test that failed
   PASS a policy refusal is reported as cancelled with the policy caveat
   PASS a report with a caveat renders the not-verified section
   PASS a state short of the success states is not verified even with green checks
@@ -246,11 +268,11 @@ $ java -cp out RunnerKt
   PASS the full happy path is allowed
 == org.junit.Test (0 tests)
 
-RESULT passed=204 failed=0
+RESULT passed=224 failed=0
 run exit=0
 
 # Style checks the sandbox could not run through Gradle: line length / trailing whitespace / final newline
-files checked=40 issues=0
+files checked=43 issues=0
 
 $ git diff --shortstat 414c780 HEAD   (inside the clean clone)
- 47 files changed, 6393 insertions(+)
+ 49 files changed, 7066 insertions(+)

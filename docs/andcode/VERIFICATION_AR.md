@@ -29,6 +29,7 @@ Maven.
 ```
 == core.buildcheck.FailureClassifierTest     (9 tests) ->  9 PASS
 == core.buildcheck.ProjectDetectorTest      (12 tests) -> 12 PASS
+== core.buildcheck.TestReportParserTest     (18 tests) -> 18 PASS
 == core.capability.CapabilityRegistryTest   (15 tests) -> 15 PASS
 == core.capability.CapabilityValidatorTest  (16 tests) -> 16 PASS
 == core.memory.ProjectMemoryTest            (15 tests) -> 15 PASS
@@ -38,15 +39,15 @@ Maven.
 == core.policy.ToolCallMapperTest           (11 tests) -> 11 PASS
 == core.security.SecretRedactionTest        (15 tests) -> 15 PASS   (14 قائمة + 1 جديد)
 == core.task.TaskProgressCodecTest          (17 tests) -> 17 PASS
-== core.task.TaskReportBuilderTest          (13 tests) -> 13 PASS
+== core.task.TaskReportBuilderTest          (15 tests) -> 15 PASS
 == core.task.TaskResumeTest                 (13 tests) -> 13 PASS
 == core.task.TaskRunnerTest                 (18 tests) -> 18 PASS
 == core.task.TaskStateMachineTest           (11 tests) -> 11 PASS
 
-RESULT passed=204 failed=0
+RESULT passed=224 failed=0
 ```
 
-المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّقت عليها الـ patches الثمانية بـ `git am`** (لا
+المصادر في التشغيل الأخير مأخوذة من **نسخة استنساخ نظيفة طُبِّقت عليها الـ patches التسعة بـ `git am`** (لا
 من شجرة عمل معدّلة يدويًا)، أي أن ما تم تشغيله هو بالضبط ما سيصل إلى المستودع.
 
 الشيفرة تُترجم بلا أخطاء ولا تحذيرات، والاختبارات الـ 14 القائمة لـ`SecretRedaction` تمر بعد إضافة النمط
@@ -64,18 +65,19 @@ RESULT passed=204 failed=0
 | حزمة `core/build` **لم تُسجَّل في Git إطلاقًا** | `.gitignore` في المستودع يتجاهل `build/` فأسقط مجلد الحزمة من `git add` | أُعيدت التسمية إلى `core/buildcheck`، وأُضيف سبب التسمية إلى `docs/BUILD_CHECKS.md` حتى لا يتكرر الفخ |
 | كل خطوة لم تبدأ أو لم تنته بعد تُرفض عند قراءة المهمة المحفوظة | `optionalLong` كانت تُعيد `null` للعمود الفارغ، و`?: return Rejected(...)` عند موقع الاستدعاء تلتبس بين «غائب» و«غير صالح» | فُصلت الحالة صراحة: عمود فارغ = `null`، وغير الفارغ غير الرقمي = رفض مسمّى |
 | رسالة فشل تحوي `|` أو سطرًا جديدًا **تُفسد الملف المحفوظ** | عمود الفشل كان يُمرَّر على `SecretRedaction` فقط دون `escape` | أُضيف `escape` بعد التنقيح، واختبار برسالة تحوي الأنواع الثلاثة |
+| اختبار تقرير الاختبارات توقّع اختبارين من سطر واحد | بيانات الاختبار نفسها كانت ناقصة (سطر واحد لاختبار ناجح لم يُكتب) | أُضيف السطر الناقص؛ وكشف التشغيل أن الفارق بين المعلن والمقروء يُعلَن بـ`countsDisagree` لا يُخفى |
 
 ### فحوص تنسيق أُجريت يدويًا (لأن spotless غير متاح)
 
 سكربت فحص على الملفات المتأثرة: طول السطر ≤ 140، لا مسافات زائدة في نهاية السطر، لا تبويبات،
-سطر جديد في نهاية الملف → `files checked=40 issues=0` على كل ملفات الحزم الجديدة. الملفات تتبع أسلوب المستودع (تعليقات KDoc
+سطر جديد في نهاية الملف → `files checked=43 issues=0` على كل ملفات الحزم الجديدة. الملفات تتبع أسلوب المستودع (تعليقات KDoc
 تشرح السبب، أسماء اختبارات بين backticks، فواصل لاحقة trailing commas كما في بقية المشروع).
 
 ## فحص تطبيق الـ patches على نسخة نظيفة
 
 ```
 $ git clone --depth 1 https://github.com/yuga-hashimoto/and-code.git /tmp/applycheck2
-$ git am patches/0001-*.patch ... patches/0008-*.patch
+$ git am patches/0001-*.patch ... patches/0009-*.patch
 Applying: feat(policy): add an in-app risk engine and task state machine
 Applying: feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
 Applying: feat(capability): add a validated capability registry with a lifecycle
@@ -84,20 +86,22 @@ Applying: feat(buildcheck): detect the project type and plan bounded, classified
 Applying: feat(task): build the end-of-task report with a verdict that cannot be talked up
 Applying: feat(task): add a runner that drives plan, policy, checks and report
 Applying: feat(task): add a strict, dependency-free format for a saved task
-$ git log --oneline -9
-41425bd feat(task): add a strict, dependency-free format for a saved task
-7621993 feat(task): add a runner that drives plan, policy, checks and report
-8cf06f3 feat(task): build the end-of-task report with a verdict that cannot be talked up
-24b33eb feat(buildcheck): detect the project type and plan bounded, classified checks
-05219d8 feat(memory): add a project memory that refuses secrets and mistrusts summaries
-0b3342c feat(capability): add a validated capability registry with a lifecycle
-d694891 feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
-b8599c1 feat(policy): add an in-app risk engine and task state machine
+Applying: feat(buildcheck): read per-test results out of a check's output
+$ git log --oneline -10
+40bb7bd feat(buildcheck): read per-test results out of a check's output
+bf7d7a5 feat(task): add a strict, dependency-free format for a saved task
+7d4502a feat(task): add a runner that drives plan, policy, checks and report
+efb9460 feat(task): build the end-of-task report with a verdict that cannot be talked up
+5a84aac feat(buildcheck): detect the project type and plan bounded, classified checks
+64d4dbc feat(memory): add a project memory that refuses secrets and mistrusts summaries
+8ba1927 feat(capability): add a validated capability registry with a lifecycle
+88ac391 feat(task): add resume, confirmation and cancellation rules, plus the tool-call mapper
+8c8cbc7 feat(policy): add an in-app risk engine and task state machine
 414c780 Merge pull request #404 from yuga-hashimoto/feat/402-edit-local-workspace-files
 ```
 
-أي أن الـ patches الثمانية تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، وتشغيل الاختبارات
-أعلاه جرى على هذه النسخة بالضبط (40 ملفًا فُحص تنسيقيًا: لا سطر > 140، لا مسافات زائدة).
+أي أن الـ patches التسعة تُطبَّق بالترتيب وبلا تعارض على `main` الحالي (`414c780`)، وتشغيل الاختبارات
+أعلاه جرى على هذه النسخة بالضبط (43 ملفًا فُحص تنسيقيًا: لا سطر > 140، لا مسافات زائدة).
 
 ## ما لم يُشغَّل (وهذا مذكور كقيد، لا كنجاح)
 

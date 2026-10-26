@@ -1,0 +1,809 @@
+From e18a4dadca3166e6de2496482229dd629e00eb34 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Mon, 26 Oct 2026 04:04:26 +0000
+Subject: [PATCH] feat(buildcheck): read per-test results out of a check's
+ output
+
+Ninth slice: "the check failed" is not actionable, the report has to name the
+test. TaskReport previously carried only the class of failure.
+
+core/buildcheck/TestReport.kt parses three shapes out of the output the app
+already holds, strongest evidence first:
+- JUnit XML (what Gradle writes under build/test-results): totals from the
+  testsuite attributes, status from each testcase. A hand-written scanner
+  rather than an XML library, because the input is the tail of a log and may be
+  cut mid-tag, where a real parser throws and this reports what it could read.
+- Gradle's per-test console lines, with the first indented line of the trace as
+  the message.
+- A summary line: real counts, no names.
+
+The numbers are kept honest rather than optimistic:
+- an unrecognised log is TestReportSource.NONE with total 0, so a green exit
+  code with no report never becomes "all tests passed";
+- when the declared totals and the enumerated cases disagree (truncated log, or
+  a run that only printed failures) countsDisagree is set and the report says
+  so instead of showing a confident wrong number;
+- names and messages are flattened, bounded (200/300 chars) and redacted, so a
+  stack trace or a captured token never reaches the report;
+- the scan itself is bounded (512 KiB, 5000 cases, 50 listed failures) because
+  the text comes from a subprocess.
+
+TaskReport.testSummaries() puts the result in the end-of-task report under a
+"tests:" section, and renders nothing when no check produced a report.
+
+Tests: TestReportParserTest (18), plus two TaskReportBuilderTest cases (15).
+---
+ .../andcode/core/buildcheck/TestReport.kt     | 349 ++++++++++++++++++
+ .../andcode/core/task/TaskReport.kt           |  21 ++
+ .../core/buildcheck/TestReportParserTest.kt   | 255 +++++++++++++
+ .../core/task/TaskReportBuilderTest.kt        |  26 ++
+ docs/BUILD_CHECKS.md                          |  28 +-
+ docs/TASK_LIFECYCLE.md                        |   2 +
+ 6 files changed, 677 insertions(+), 4 deletions(-)
+ create mode 100644 app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/TestReport.kt
+ create mode 100644 app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/TestReportParserTest.kt
+
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/TestReport.kt b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/TestReport.kt
+new file mode 100644
+index 0000000..b96802c
+--- /dev/null
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/buildcheck/TestReport.kt
+@@ -0,0 +1,349 @@
++package com.yugahashimoto.andcode.core.buildcheck
++
++import com.yugahashimoto.andcode.core.security.SecretRedaction
++
++/** How one test ended. */
++enum class TestStatus {
++    PASSED,
++    FAILED,
++    SKIPPED,
++}
++
++/** Where the numbers in a [TestReport] came from, so a reader knows how far to trust them. */
++enum class TestReportSource {
++    /** JUnit XML (Gradle writes it under `build/test-results/…`). The strongest evidence. */
++    JUNIT_XML,
++
++    /** The console lines Gradle prints per test (`com.example.FooTest > name FAILED`). */
++    GRADLE_CONSOLE,
++
++    /** Only a summary line (`12 tests completed, 2 failed`). The count is real, the names are not. */
++    SUMMARY_LINE,
++
++    /** Nothing recognisable in the output. Never read this as "everything passed". */
++    NONE,
++}
++
++/**
++ * One test, as the report names it. [message] is a redacted single line: a stack trace would fill the
++ * report and could carry captured values.
++ */
++data class TestCaseResult(
++    val name: String,
++    val suite: String? = null,
++    val status: TestStatus,
++    val message: String? = null,
++) {
++    /** `suite > name`, or just the name when the format does not name a suite. */
++    val display: String get() = if (suite.isNullOrBlank()) name else "$suite > $name"
++}
++
++/**
++ * Per-test results parsed out of a check's output.
++ *
++ * This exists because "the check failed" is not actionable: the report has to name the test that failed.
++ * Parsing is done here, in app code, from text the app already holds - nothing is executed and no test
++ * framework is linked in.
++ *
++ * Two rules keep the numbers honest:
++ * - [source] is [TestReportSource.NONE] when nothing was recognised, and [total] stays 0. A green exit code
++ *   with no recognisable report does not become "all tests passed".
++ * - When the declared totals (the `tests="…"` attribute, or the summary line) and the enumerated cases
++ *   disagree, [countsDisagree] is set. That happens on truncated output, and the reader is told rather than
++ *   shown a confident wrong number.
++ */
++data class TestReport(
++    val total: Int,
++    val passed: Int,
++    val failed: Int,
++    val skipped: Int,
++    /** Failed cases only, bounded by [TestReportParser.MAX_FAILURES]. */
++    val failures: List<TestCaseResult>,
++    val source: TestReportSource,
++    val countsDisagree: Boolean = false,
++    /** More tests failed than [failures] lists. */
++    val failuresTruncated: Boolean = false,
++) {
++    /** True when the parser found no test evidence at all. */
++    val isEmpty: Boolean get() = source == TestReportSource.NONE
++
++    val hasFailures: Boolean get() = failed > 0
++
++    /** One line per fact, for the task report. Empty for an [isEmpty] report. */
++    fun summaryLines(): List<String> {
++        if (isEmpty) return emptyList()
++        val lines = mutableListOf<String>()
++        lines += "$total tests: $passed passed, $failed failed, $skipped skipped (${source.name})"
++        failures.forEach { failure -> lines += "failed: ${failure.display}${failure.message?.let { " - $it" } ?: ""}" }
++        if (failuresTruncated) lines += "only the first ${failures.size} failures are listed"
++        if (countsDisagree) lines += "the declared totals disagree with the tests that could be read; output truncated?"
++        return lines
++    }
++}
++
++/**
++ * Reads JUnit XML, Gradle's per-test console lines, or a summary line out of a check's output.
++ *
++ * A hand-written scanner rather than an XML library: the input is already truncated to the tail of a log,
++ * may be cut mid-tag, and a real parser would throw on that instead of reporting what it could read. The
++ * scan is bounded ([MAX_SCAN_CHARS], [MAX_CASES]) because the input comes from a subprocess.
++ */
++object TestReportParser {
++    const val MAX_SCAN_CHARS = 512 * 1024
++    const val MAX_CASES = 5_000
++    const val MAX_FAILURES = 50
++    const val MAX_MESSAGE_LENGTH = 300
++
++    private val CONSOLE_LINE = Regex("""^(\S.*?)\s+>\s+(.+?)\s+(PASSED|FAILED|SKIPPED)\s*$""")
++
++    private val SUMMARY_COMPLETED =
++        Regex(
++            """(\d+)\s+tests?\s+completed(?:,\s*(\d+)\s+failed)?(?:,\s*(\d+)\s+skipped)?""",
++            RegexOption.IGNORE_CASE,
++        )
++    private val SUMMARY_FAILED = Regex("""(\d+)\s+tests?\s+failed""", RegexOption.IGNORE_CASE)
++
++    /** Parses whatever is recognisable. Never throws, never runs anything. */
++    fun parse(output: String): TestReport {
++        if (output.isBlank()) return empty()
++        val text = if (output.length > MAX_SCAN_CHARS) output.takeLast(MAX_SCAN_CHARS) else output
++        parseJUnitXml(text)?.let { return it }
++        parseConsole(text)?.let { return it }
++        return parseSummary(text) ?: empty()
++    }
++
++    private fun empty() =
++        TestReport(
++            total = 0,
++            passed = 0,
++            failed = 0,
++            skipped = 0,
++            failures = emptyList(),
++            source = TestReportSource.NONE,
++        )
++
++    // --- JUnit XML -------------------------------------------------------------------------------
++
++    private data class DeclaredTotals(
++        val total: Int,
++        val failed: Int,
++        val skipped: Int,
++    )
++
++    private fun parseJUnitXml(text: String): TestReport? {
++        if (!text.contains("<testcase") && !text.contains("<testsuite")) return null
++        val cases = mutableListOf<TestCaseResult>()
++        var cursor = text.indexOf("<testcase")
++        while (cursor >= 0 && cases.size < MAX_CASES) {
++            val tagEnd = text.indexOf('>', cursor)
++            if (tagEnd < 0) break
++            val attributes = text.substring(cursor + "<testcase".length, tagEnd)
++            val selfClosing = attributes.trimEnd().endsWith("/")
++            val name = cleanName(attribute(attributes, "name")) ?: "unnamed"
++            val suite = cleanName(attribute(attributes, "classname")) ?: cleanName(attribute(attributes, "class"))
++            var next = tagEnd + 1
++            var status = TestStatus.PASSED
++            var message: String? = null
++            if (!selfClosing) {
++                val close = text.indexOf("</testcase>", tagEnd)
++                val body = text.substring(tagEnd + 1, if (close >= 0) close else text.length)
++                if (close >= 0) next = close + "</testcase>".length
++                val failureTag = elementAttributes(body, "failure") ?: elementAttributes(body, "error")
++                when {
++                    failureTag != null -> {
++                        status = TestStatus.FAILED
++                        message = cleanMessage(attribute(failureTag, "message") ?: elementText(body, "failure"))
++                    }
++                    body.contains("<skipped") -> status = TestStatus.SKIPPED
++                }
++            }
++            cases += TestCaseResult(name = name, suite = suite, status = status, message = message)
++            cursor = text.indexOf("<testcase", next)
++        }
++        val declared = declaredTotals(text)
++        if (cases.isEmpty() && declared == null) return null
++
++        val enumeratedFailures = cases.filter { it.status == TestStatus.FAILED }
++        val unknownTail = cases.size >= MAX_CASES
++        val total = declared?.total ?: cases.size
++        val failed = declared?.failed ?: enumeratedFailures.size
++        val skipped = declared?.skipped ?: cases.count { it.status == TestStatus.SKIPPED }
++        val disagree =
++            declared != null &&
++                !unknownTail &&
++                (declared.total != cases.size || declared.failed != enumeratedFailures.size)
++        return TestReport(
++            total = total,
++            passed = (total - failed - skipped).coerceAtLeast(0),
++            failed = failed,
++            skipped = skipped,
++            failures = enumeratedFailures.take(MAX_FAILURES),
++            source = TestReportSource.JUNIT_XML,
++            countsDisagree = disagree,
++            failuresTruncated = enumeratedFailures.size > MAX_FAILURES,
++        )
++    }
++
++    private fun declaredTotals(text: String): DeclaredTotals? {
++        val attributes = elementAttributes(text, "testsuite") ?: return null
++        val total = attribute(attributes, "tests")?.toIntOrNull() ?: return null
++        val failures = attribute(attributes, "failures")?.toIntOrNull() ?: 0
++        val errors = attribute(attributes, "errors")?.toIntOrNull() ?: 0
++        val skipped =
++            (attribute(attributes, "skipped")?.toIntOrNull() ?: 0) +
++                (attribute(attributes, "disabled")?.toIntOrNull() ?: 0)
++        return DeclaredTotals(total = total, failed = failures + errors, skipped = skipped)
++    }
++
++    /** The attributes of the first `<name …>` after [from], or null when the element is absent. */
++    private fun elementAttributes(
++        text: String,
++        name: String,
++    ): String? {
++        val start = text.indexOf("<$name")
++        if (start < 0) return null
++        val end = text.indexOf('>', start)
++        if (end < 0) return null
++        return text.substring(start + name.length + 1, end)
++    }
++
++    /** The text of the first `<name …>…</name>`, unescaped and flattened. */
++    private fun elementText(
++        text: String,
++        name: String,
++    ): String? {
++        val start = text.indexOf("<$name")
++        if (start < 0) return null
++        val open = text.indexOf('>', start)
++        if (open < 0) return null
++        val close = text.indexOf("</$name>", open)
++        if (close < 0) return null
++        return text.substring(open + 1, close)
++    }
++
++    private fun attribute(
++        attributes: String,
++        name: String,
++    ): String? {
++        val match = Regex("""\b$name\s*=\s*"([^"]*)"""").find(attributes) ?: return null
++        return match.groupValues[1]
++    }
++
++    // --- Gradle console --------------------------------------------------------------------------
++
++    private fun parseConsole(text: String): TestReport? {
++        val lines = text.lines()
++        val cases = mutableListOf<TestCaseResult>()
++        var index = 0
++        while (index < lines.size && cases.size < MAX_CASES) {
++            val match = CONSOLE_LINE.matchEntire(lines[index].trim())
++            if (match == null) {
++                index++
++                continue
++            }
++            val suite = cleanName(match.groupValues[1])
++            val name = cleanName(match.groupValues[2]) ?: "unnamed"
++            val status =
++                when (match.groupValues[3]) {
++                    "FAILED" -> TestStatus.FAILED
++                    "SKIPPED" -> TestStatus.SKIPPED
++                    else -> TestStatus.PASSED
++                }
++            val detail = if (status == TestStatus.FAILED) firstIndentedLine(lines, index + 1) else null
++            cases += TestCaseResult(name = name, suite = suite, status = status, message = detail)
++            index++
++        }
++        if (cases.isEmpty()) return null
++
++        val failures = cases.filter { it.status == TestStatus.FAILED }
++        val skipped = cases.count { it.status == TestStatus.SKIPPED }
++        val total = cases.size
++        val summary = summaryTotals(text)
++        val disagree = summary != null && summary.total != total
++        return TestReport(
++            total = total,
++            passed = (total - failures.size - skipped).coerceAtLeast(0),
++            failed = failures.size,
++            skipped = skipped,
++            failures = failures.take(MAX_FAILURES),
++            source = TestReportSource.GRADLE_CONSOLE,
++            countsDisagree = disagree,
++            failuresTruncated = failures.size > MAX_FAILURES,
++        )
++    }
++
++    private fun firstIndentedLine(
++        lines: List<String>,
++        from: Int,
++    ): String? {
++        for (index in from until minOf(from + 4, lines.size)) {
++            val line = lines[index]
++            if (line.isBlank()) continue
++            if (!line.first().isWhitespace()) return null
++            cleanMessage(line)?.let { return it }
++        }
++        return null
++    }
++
++    // --- Summary line ----------------------------------------------------------------------------
++
++    private data class SummaryTotals(
++        val total: Int,
++        val failed: Int,
++        val skipped: Int,
++    )
++
++    private fun summaryTotals(text: String): SummaryTotals? {
++        SUMMARY_COMPLETED.findAll(text).lastOrNull()?.let { match ->
++            val total = match.groupValues[1].toIntOrNull() ?: return@let
++            val failed = match.groupValues[2].toIntOrNull() ?: 0
++            val skipped = match.groupValues[3].toIntOrNull() ?: 0
++            return SummaryTotals(total = total, failed = failed, skipped = skipped)
++        }
++        SUMMARY_FAILED.findAll(text).lastOrNull()?.let { match ->
++            val failed = match.groupValues[1].toIntOrNull() ?: return@let
++            return SummaryTotals(total = failed, failed = failed, skipped = 0)
++        }
++        return null
++    }
++
++    private fun parseSummary(text: String): TestReport? {
++        val summary = summaryTotals(text) ?: return null
++        return TestReport(
++            total = summary.total,
++            passed = (summary.total - summary.failed - summary.skipped).coerceAtLeast(0),
++            failed = summary.failed,
++            skipped = summary.skipped,
++            failures = emptyList(),
++            source = TestReportSource.SUMMARY_LINE,
++        )
++    }
++
++    // --- Text handling ---------------------------------------------------------------------------
++
++    /** A test name is shown in the report, so it is flattened and bounded like any other scraped text. */
++    private fun cleanName(raw: String?): String? {
++        val value = raw?.let { unescape(it) }?.replace('\n', ' ')?.replace('\r', ' ')?.trim()
++        return value?.takeIf { it.isNotEmpty() }?.take(200)
++    }
++
++    /** A failure message is one redacted line: stack traces and captured values do not belong in a report. */
++    private fun cleanMessage(raw: String?): String? {
++        if (raw == null) return null
++        val flattened = unescape(raw).replace('\n', ' ').replace('\r', ' ').replace(Regex("""\s+"""), " ").trim()
++        if (flattened.isEmpty()) return null
++        return SecretRedaction.redact(flattened).take(MAX_MESSAGE_LENGTH)
++    }
++
++    /** The five XML entities the test frameworks actually emit; anything else is left alone. */
++    private fun unescape(text: String): String =
++        text
++            .replace("&lt;", "<")
++            .replace("&gt;", ">")
++            .replace("&quot;", "\"")
++            .replace("&apos;", "'")
++            .replace("&amp;", "&")
++}
++
++/** Convenience: the per-test report for a finished check, computed from the output it already carries. */
++fun CheckResult.testReport(): TestReport = TestReportParser.parse(output)
+diff --git a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt
+index 2c7d9e9..96d8748 100644
+--- a/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt
++++ b/app/src/main/java/com/yugahashimoto/andcode/core/task/TaskReport.kt
+@@ -2,6 +2,7 @@ package com.yugahashimoto.andcode.core.task
+ 
+ import com.yugahashimoto.andcode.core.buildcheck.CheckResult
+ import com.yugahashimoto.andcode.core.buildcheck.FailureClass
++import com.yugahashimoto.andcode.core.buildcheck.testReport
+ import com.yugahashimoto.andcode.core.policy.PolicyAuditEntry
+ 
+ /** What actually happened to one step, as recorded for the report. */
+@@ -77,6 +78,21 @@ data class TaskReport(
+ 
+     val failedChecks: List<CheckResult> get() = checks.filterNot { it.passed }
+ 
++    /**
++     * Per-test detail read out of each check's own output, so the report names the failing test instead of
++     * only the class of failure. Empty when no check produced a recognisable test report - which means the
++     * report stays silent about tests rather than implying they passed.
++     */
++    fun testSummaries(): List<String> =
++        checks.flatMap { check ->
++            val report = check.testReport()
++            if (report.isEmpty) {
++                emptyList()
++            } else {
++                listOf("${check.command.id}: " + report.summaryLines().first()) + report.summaryLines().drop(1)
++            }
++        }
++
+     /** One line per caveat, in the order they were found. */
+     fun caveatLines(): List<String> =
+         caveats.map { caveat ->
+@@ -117,6 +133,11 @@ data class TaskReport(
+                 appendLine("  - ${check.command.display}: $outcome")
+                 check.failureEvidence?.let { appendLine("      $it") }
+             }
++            val testLines = testSummaries()
++            if (testLines.isNotEmpty()) {
++                appendLine("tests:")
++                testLines.forEach { appendLine("  - $it") }
++            }
+             appendLine("policy decisions: ${if (policyDecisions.isEmpty()) "none" else policyDecisions.size.toString()}")
+             policyDecisions.forEach { appendLine("  - ${it.level.name}/${it.decision.name} ${it.codes.joinToString(",")}") }
+             if (memoryFactIds.isNotEmpty()) appendLine("memory facts recorded: ${memoryFactIds.joinToString(", ")}")
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/TestReportParserTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/TestReportParserTest.kt
+new file mode 100644
+index 0000000..ff84609
+--- /dev/null
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/buildcheck/TestReportParserTest.kt
+@@ -0,0 +1,255 @@
++package com.yugahashimoto.andcode.core.buildcheck
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class TestReportParserTest {
++    private val junitXml =
++        """
++        <?xml version="1.0" encoding="UTF-8"?>
++        <testsuite name="com.example.FooTest" tests="3" skipped="1" failures="1" errors="0" time="0.2">
++          <testcase name="passes" classname="com.example.FooTest" time="0.01"/>
++          <testcase name="fails" classname="com.example.FooTest" time="0.02">
++            <failure message="expected:&lt;1&gt; but was:&lt;2&gt;">at FooTest.kt:12</failure>
++          </testcase>
++          <testcase name="skipped" classname="com.example.FooTest">
++            <skipped/>
++          </testcase>
++        </testsuite>
++        """.trimIndent()
++
++    @Test
++    fun `a JUnit XML report gives totals and names the failing test`() {
++        val report = TestReportParser.parse(junitXml)
++
++        assertEquals(TestReportSource.JUNIT_XML, report.source)
++        assertEquals(3, report.total)
++        assertEquals(1, report.passed)
++        assertEquals(1, report.failed)
++        assertEquals(1, report.skipped)
++        assertEquals(1, report.failures.size)
++        assertEquals("fails", report.failures[0].name)
++        assertEquals("com.example.FooTest > fails", report.failures[0].display)
++        assertFalse(report.countsDisagree)
++    }
++
++    @Test
++    fun `an XML failure message is unescaped so it reads like the assertion`() {
++        val message = TestReportParser.parse(junitXml).failures[0].message
++
++        assertEquals("expected:<1> but was:<2>", message)
++    }
++
++    @Test
++    fun `XML totals win when the output was cut and fewer cases survived`() {
++        val cut = junitXml.lines().take(5).joinToString("\n").replace("tests=\"3\"", "tests=\"9\"")
++
++        val report = TestReportParser.parse(cut)
++
++        assertEquals(9, report.total)
++        assertTrue(report.countsDisagree)
++    }
++
++    @Test
++    fun `an XML suite with no tests is evidence of zero tests, not a pass`() {
++        val report = TestReportParser.parse("""<testsuite name="X" tests="0" failures="0" errors="0" skipped="0"/>""")
++
++        assertEquals(TestReportSource.JUNIT_XML, report.source)
++        assertEquals(0, report.total)
++        assertFalse(report.isEmpty)
++        assertTrue(report.summaryLines().isNotEmpty())
++    }
++
++    @Test
++    fun `an XML error counts as a failure`() {
++        val xml =
++            """
++            <testsuite name="X" tests="2" failures="0" errors="1">
++              <testcase name="a" classname="X"/>
++              <testcase name="b" classname="X"><error message="boom"/></testcase>
++            </testsuite>
++            """.trimIndent()
++
++        val report = TestReportParser.parse(xml)
++
++        assertEquals(1, report.failed)
++        assertEquals("boom", report.failures[0].message)
++        assertFalse(report.countsDisagree)
++    }
++
++    @Test
++    fun `Gradle's per-test console lines are read with the first line of the trace`() {
++        val output =
++            """
++            com.example.FooTest > passes PASSED
++            com.example.FooTest > fails FAILED
++            	at FooTest.kt:12
++            	at Runner.kt:3
++            2 tests completed, 1 failed
++            """.trimIndent()
++
++        val report = TestReportParser.parse(output)
++
++        assertEquals(TestReportSource.GRADLE_CONSOLE, report.source)
++        assertEquals(2, report.total)
++        assertEquals(1, report.passed)
++        assertEquals(1, report.failed)
++        assertEquals("at FooTest.kt:12", report.failures[0].message)
++        assertFalse(report.countsDisagree)
++    }
++
++    @Test
++    fun `console lines without a summary still give honest totals`() {
++        val report = TestReportParser.parse("a.Test > one SKIPPED\na.Test > two PASSED")
++
++        assertEquals(2, report.total)
++        assertEquals(1, report.passed)
++        assertEquals(1, report.skipped)
++        assertEquals(0, report.failed)
++    }
++
++    @Test
++    fun `a summary line alone gives the counts but no names`() {
++        val report = TestReportParser.parse("12 tests completed, 2 failed, 1 skipped\nBUILD FAILED")
++
++        assertEquals(TestReportSource.SUMMARY_LINE, report.source)
++        assertEquals(12, report.total)
++        assertEquals(9, report.passed)
++        assertEquals(2, report.failed)
++        assertEquals(1, report.skipped)
++        assertTrue(report.failures.isEmpty())
++    }
++
++    @Test
++    fun `a failed-only summary is read as failures rather than inventing passes`() {
++        val report = TestReportParser.parse("2 tests failed")
++
++        assertEquals(2, report.total)
++        assertEquals(2, report.failed)
++        assertEquals(0, report.passed)
++    }
++
++    @Test
++    fun `a successful build with no test report claims nothing`() {
++        val report = TestReportParser.parse("BUILD SUCCESSFUL in 3s\n10 actionable tasks: 10 executed")
++
++        assertEquals(TestReportSource.NONE, report.source)
++        assertEquals(0, report.total)
++        assertTrue(report.isEmpty)
++        assertTrue(report.summaryLines().isEmpty())
++    }
++
++    @Test
++    fun `blank output is not a pass`() {
++        val report = TestReportParser.parse("   \n\n")
++
++        assertTrue(report.isEmpty)
++        assertEquals(0, report.total)
++    }
++
++    @Test
++    fun `a credential in a failure message never reaches the report`() {
++        val xml =
++            """
++            <testsuite name="X" tests="1" failures="1">
++              <testcase name="calls the api" classname="X">
++                <failure message="auth failed token=abcd1234secret"/>
++              </testcase>
++            </testsuite>
++            """.trimIndent()
++
++        val message = TestReportParser.parse(xml).failures[0].message.orEmpty()
++
++        assertFalse(message.contains("abcd1234secret"))
++        assertTrue(message.contains("<redacted>"))
++    }
++
++    @Test
++    fun `a stack trace is flattened into one bounded line`() {
++        val long = "boom ".repeat(400)
++        val xml = """<testsuite tests="1" failures="1"><testcase name="n"><failure message="$long"/></testcase></testsuite>"""
++
++        val message = TestReportParser.parse(xml).failures[0].message.orEmpty()
++
++        assertFalse(message.contains("\n"))
++        assertTrue(message.length <= TestReportParser.MAX_MESSAGE_LENGTH)
++    }
++
++    @Test
++    fun `a long test name is bounded so one report line cannot be unbounded`() {
++        val name = "n".repeat(300)
++        val xml = """<testsuite tests="1" failures="1"><testcase name="$name"><failure message="x"/></testcase></testsuite>"""
++
++        val parsed = TestReportParser.parse(xml).failures[0].name
++
++        assertEquals(200, parsed.length)
++    }
++
++    @Test
++    fun `the failure list is capped and says so`() {
++        val output = (1..60).joinToString("\n") { "a.Test > t$it FAILED" }
++
++        val report = TestReportParser.parse(output)
++
++        assertEquals(60, report.failed)
++        assertEquals(TestReportParser.MAX_FAILURES, report.failures.size)
++        assertTrue(report.failuresTruncated)
++        assertTrue(report.summaryLines().any { it.contains("only the first 50") })
++    }
++
++    @Test
++    fun `a truncated log tail is still parsed`() {
++        val filler = "noise ".repeat(TestReportParser.MAX_SCAN_CHARS / 6 + 100)
++        val output = filler + "\n" + "a.Test > t FAILED\n1 test completed, 1 failed"
++
++        val report = TestReportParser.parse(output)
++
++        assertEquals(TestReportSource.GRADLE_CONSOLE, report.source)
++        assertEquals(1, report.failed)
++    }
++
++    @Test
++    fun `a check carries its own report without re-running anything`() {
++        val command =
++            CheckCommand(
++                id = "jvm.test",
++                executable = "gradlew",
++                args = listOf("test"),
++                category = CheckCategory.UNIT_TEST,
++            )
++        val result =
++            CheckResult(
++                command = command,
++                exitCode = 1,
++                timedOut = false,
++                output = "a.Test > t FAILED\n1 test completed, 1 failed",
++                failure = FailureClass.TEST,
++                failureEvidence = null,
++            )
++
++        val report = result.testReport()
++
++        assertEquals(1, report.total)
++        assertEquals(1, report.failed)
++    }
++
++    @Test
++    fun `a passing check with no report is still no evidence`() {
++        val command = CheckCommand("node.test", "npm", listOf("test"), CheckCategory.UNIT_TEST)
++        val result =
++            CheckResult(
++                command = command,
++                exitCode = 0,
++                timedOut = false,
++                output = "ok",
++                failure = FailureClass.UNKNOWN,
++                failureEvidence = null,
++            )
++
++        assertTrue(result.testReport().isEmpty)
++        assertNull(result.testReport().failures.firstOrNull())
++    }
++}
+diff --git a/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt
+index c00739f..24b7093 100644
+--- a/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt
++++ b/app/src/test/java/com/yugahashimoto/andcode/core/task/TaskReportBuilderTest.kt
+@@ -137,4 +137,30 @@ class TaskReportBuilderTest {
+         assertTrue(TaskReportBuilder.build(input().copy(coreChange = true)).needsNewApk)
+         assertFalse(TaskReportBuilder.build(input()).needsNewApk)
+     }
++
++    @Test
++    fun `a failing check's report names the test that failed`() {
++        val withTests =
++            FailureClassifier.result(
++                command,
++                1,
++                false,
++                "com.example.FooTest > adds numbers PASSED\n" +
++                    "com.example.FooTest > rejects nulls FAILED\n\tat FooTest.kt:12\n" +
++                    "2 tests completed, 1 failed",
++            )
++        val text = TaskReportBuilder.build(input(state = TaskState.FAILED, checks = listOf(withTests))).render()
++
++        assertTrue(text.contains("tests:"))
++        assertTrue(text.contains("test: 2 tests: 1 passed, 1 failed, 0 skipped"))
++        assertTrue(text.contains("failed: com.example.FooTest > rejects nulls"))
++    }
++
++    @Test
++    fun `a check with no recognisable test report adds no test lines`() {
++        val report = TaskReportBuilder.build(input())
++
++        assertTrue(report.testSummaries().isEmpty())
++        assertFalse(report.render().contains("tests:"))
++    }
+ }
+diff --git a/docs/BUILD_CHECKS.md b/docs/BUILD_CHECKS.md
+index ba8a89c..e9051c0 100644
+--- a/docs/BUILD_CHECKS.md
++++ b/docs/BUILD_CHECKS.md
+@@ -17,8 +17,9 @@ looked like "my new files did not commit" to the next contributor.
+ | `ProjectProfile.kt` | `ProjectType`, `CheckCategory`, `CheckCommand` (+ `isSafe`), `ProjectProfile`, `CheckResult`, `FailureClass` |
+ | `ProjectDetector.kt` | filename-based detection and the per-type check list |
+ | `FailureClassifier.kt` | output → `ENVIRONMENT` / `CODE` / `TEST` / `TIMEOUT` / `UNKNOWN` |
++| `TestReport.kt` | per-test results parsed out of a check's output (JUnit XML, Gradle console lines, summary) |
+ 
+-Tests: `ProjectDetectorTest` (12), `FailureClassifierTest` (9).
++Tests: `ProjectDetectorTest` (12), `FailureClassifierTest` (9), `TestReportParserTest` (18).
+ 
+ ## Detection
+ 
+@@ -61,6 +62,25 @@ ordering would report every setup problem as "your code is broken" and send the
+ direction. `CheckResult.failureEvidence` is one trimmed line around the match, capped at 200 characters, and
+ `output` itself is truncated to the command's `maxOutputBytes`.
+ 
++## Per-test reports
++
++"the check failed" is not actionable - the report has to name the test. `TestReportParser` reads three
++shapes out of the output the app already holds, strongest first:
++
++1. **JUnit XML** (what Gradle writes to `build/test-results/…`): totals from the `testsuite` attributes,
++   statuses from each `testcase`. A hand-written scanner, not an XML library, because the input is the tail
++   of a log and may be cut mid-tag; a real parser would throw where this reports what it could read.
++2. **Gradle's per-test console lines** (`com.example.FooTest > name FAILED`), with the first indented line of
++   the trace as the message.
++3. **A summary line** (`12 tests completed, 2 failed`) - real counts, no names.
++
++Rules that keep the numbers honest: an unrecognised log yields `TestReportSource.NONE` and `total = 0`, never
++"all tests passed" (`isEmpty`); when the declared totals and the enumerated cases disagree (a truncated log,
++or a run that only printed failures) `countsDisagree` is set and the report says so; test names and messages
++are flattened, bounded (200 / 300 characters) and passed through `SecretRedaction`; the scan is bounded
++(512 KiB, 5,000 cases, 50 listed failures). `CheckResult.testReport()` reads a finished check, and
++`TaskReport.testSummaries()` puts the result in the end-of-task report. Nothing is executed: this parses text.
++
+ ## What is not implemented
+ 
+ Execution. `CheckCommand` describes a bounded command; running it requires the device's process facilities,
+@@ -68,6 +88,6 @@ which in this app means going through the existing runtime/terminal path with th
+ it (`core/policy`), not a new `ProcessBuilder` hidden inside a core module. That integration is the next
+ change, and this document says so instead of implying a build runner exists.
+ 
+-Also not implemented: parsing test reports into per-test results (only the class of failure is derived), and
+-any retry loop - `FailureClassifier` reports whether a retry *could* help, `core/task` decides whether to
+-spend one.
++Also not implemented: reading the XML files from the workspace (the app has no file listing for the test
++results directory yet, so the parser reads whatever text the check's output carries), and any retry loop -
++`FailureClassifier` reports whether a retry *could* help, `core/task` decides whether to spend one.
+diff --git a/docs/TASK_LIFECYCLE.md b/docs/TASK_LIFECYCLE.md
+index 8e31767..b96a8f2 100644
+--- a/docs/TASK_LIFECYCLE.md
++++ b/docs/TASK_LIFECYCLE.md
+@@ -99,6 +99,8 @@ step=edit|DONE|1|1|1700000000001|1700000000002|
+ 
+ ## What is still missing
+ 
++- **Per-test detail in the report** is read from the check output by `core/buildcheck/TestReportParser`
++  (`TaskReport.testSummaries()`); the app does not yet read the JUnit XML files from the workspace.
+ - **The file itself.** The codec and the `previous` plumbing exist; nothing writes the text to a file yet -
+   that is the storage change, and it needs the Android test suite to be meaningful.
+ - **The UI.** No screen calls `TaskRunner` yet; the task centre, plan sheet and report view are the next
+-- 
+2.39.5
+
